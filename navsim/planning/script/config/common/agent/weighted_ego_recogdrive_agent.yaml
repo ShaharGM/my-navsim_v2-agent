@@ -1,0 +1,20 @@
+_target_: navsim.agents.recogdrive.weighted_ego_recogdrive_agent.WeightedEgoRecogDriveAgent
+_convert_: 'all'
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  time_horizon: 4
+  interval_length: 0.5
+checkpoint_path: ''
+recogdrive_checkpoint_path: ''
+vlm_path: ''
+vlm_type: 'internvl'
+dit_type: 'small'
+sampling_method: 'ddim'
+cache_mode: True
+cache_hidden_state: True
+vlm_size: 'large'
+lr: 1e-4
+
+num_future: 8

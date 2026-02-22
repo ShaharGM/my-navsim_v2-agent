@@ -1,0 +1,106 @@
+# Configuration for ActionDiffusionAgent
+#
+# Usage:  Add "agent: action_diffusion_agent" to your training YAML, or
+#         override from the command line with:
+#           agent=action_diffusion_agent
+#
+# Backbone options
+# ----------------
+#   backbone_type: 'timm'
+#       Any model registered in the timm library.
+#       e.g. timm_model_name: "resnet50"             (default, fast)
+#            timm_model_name: "convnext_small"        (stronger, still fast)
+#            timm_model_name: "vit_base_patch16_224"  (ViT, needs smaller image)
+#
+#   backbone_type: 'vov'
+#       VoVNet V-99-eSE (same as the GTRS/HydraBackboneBEV pipeline).
+#       Requires a pretrained checkpoint; set vov_ckpt to the .pth path.
+#
+# Freeze / unfreeze
+# -----------------
+#   freeze_backbone: true   → only train status encoder + diffusion head  (default)
+#   freeze_backbone: false  → full end-to-end fine-tuning (needs lower LR for backbone)
+#
+# Pretrained checkpoint loading
+# -----------------------------
+#   pretrained_ckpt   - loads backbone + projection weights from a prior run
+#                       (strips "agent.model." prefix; skips diffusion_head)
+#   checkpoint_path   - restores the *complete* agent state for inference / resume
+
+_target_: navsim.agents.action_diffusion_agent.ad_agent.ActionDiffusionAgent
+_convert_: 'all'
+
+# ── Agent-level training parameters ──────────────────────────────────────────
+lr: 1.0e-4
+checkpoint_path: null   # full Lightning checkpoint for inference / resume
+
+# LR Scheduler: null | 'cosine' | 'step' | 'cycle' | 'plateau'
+scheduler: null
+
+# Total number of optimisation steps; only used by scheduler='cycle'.
+# A typical value: num_epochs * (dataset_size / batch_size)
+total_train_steps: 50000
+
+# ── Model configuration ───────────────────────────────────────────────────────
+config:
+  _target_: navsim.agents.action_diffusion_agent.ad_config.ActionDiffusionConfig
+  _convert_: 'all'
+
+  # ── Trajectory output ──────────────────────────────────────────────────────
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    time_horizon: 4
+    interval_length: 0.5   # 8 output waypoints
+
+  # ── Camera input ───────────────────────────────────────────────────────────
+  camera_width: 2048
+  camera_height: 512
+  seq_len: 1              # 1 = most-recent frame only; set to 2 for temporal context
+  use_back_view: false    # set to true to add the rear panoramic view
+
+  # ── Perception backbone ────────────────────────────────────────────────────
+  backbone_type: "timm"
+  timm_model_name: "resnet50"
+  timm_pretrained: true   # load ImageNet-pretrained weights from timm hub
+  vov_ckpt: ""            # only used when backbone_type='vov'
+  freeze_backbone: true   # freeze backbone + projection; train only the head
+
+  # ── Spatial pooling ────────────────────────────────────────────────────────
+  # num_image_tokens = img_vert_anchors × img_horz_anchors
+  # (× 2 when use_back_view=true)
+  img_vert_anchors: 16
+  img_horz_anchors: 64
+
+  # ── Core model dimensions ──────────────────────────────────────────────────
+  model_dim: 256
+  ffn_dim: 1024
+  num_heads: 8
+
+  # ── Ego-status ─────────────────────────────────────────────────────────────
+  ego_status_dim: 8       # [cmd(4), vx(1), vy(1), ax(1), ay(1)]
+
+  # ── Diffusion head ─────────────────────────────────────────────────────────
+  num_diffusion_layers: 4
+  num_diffusion_timesteps: 100
+  num_inference_proposals: 64  # reduce to 16–32 for faster inference
+
+  # ── Unicycle action space ──────────────────────────────────────────────────
+  internal_dt: 0.1         # integration time step [s]
+  internal_horizon: 40     # 4 s / 0.1 s = 40 dense steps
+  action_dim: 2            # (acceleration, curvature)
+
+  # Z-score statistics for action normalisation (estimated on mini split)
+  accel_mean: 0.05671
+  accel_std: 1.12148
+  curv_mean: 0.00180
+  curv_std: 0.02297
+
+  # ── Weight loading ─────────────────────────────────────────────────────────
+  # Path to a checkpoint from which backbone + projection are loaded.
+  # Set to "" to start from scratch / timm ImageNet weights.
+  pretrained_ckpt: ""
+
+  # ── Training ───────────────────────────────────────────────────────────────
+  weight_decay: 0.0
+  dp_loss_weight: 10.0

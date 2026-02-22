@@ -1,0 +1,38 @@
+_target_: navsim.agents.diffusion_forcing.diffusion_forcing_agent.DiffusionForcingAgent
+_convert_: 'all'
+
+trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  time_horizon: 4
+  interval_length: 0.5
+
+history_steps: 4
+pose_dim: 3
+pose_stack: 1
+guidance_scale: 1.0
+context_frames: 1
+chunk_size: 1
+external_cond_dim: 0
+causal: false
+uncertainty_scale: 1.0
+lr: 1e-5
+diffusion_timesteps: 1000
+diffusion_sampling_timesteps: 20
+diffusion_clip_noise: true
+diffusion_cum_snr_decay: 0.9
+diffusion_beta_schedule: cosine
+diffusion_schedule_fn_kwargs: {}
+diffusion_objective: pred_noise
+diffusion_use_fused_snr: true
+diffusion_snr_clip: 5.0
+diffusion_ddim_sampling_eta: 0.0
+diffusion_architecture: transformer
+diffusion_network_size: 128
+diffusion_num_layers: 4
+diffusion_attn_heads: 4
+diffusion_dim_feedforward: 512
+diffusion_stabilization_level: 10
+plan_anchor_path: /sci/labs/sagieb/dawndude/projects/DiffusionDrive/models/utils/kmeans_navsim_traj_20.npy
+
+checkpoint_path: null

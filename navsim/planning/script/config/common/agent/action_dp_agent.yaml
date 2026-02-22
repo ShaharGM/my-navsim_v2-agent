@@ -1,0 +1,36 @@
+_target_: navsim.agents.full_gtrs_dense.action_dp_agent.dp_agent.DPAgent
+_convert_: 'all'
+
+config:
+  _target_: navsim.agents.full_gtrs_dense.action_dp_agent.dp_config.DPConfig
+  _convert_: 'all'
+  seq_len: 2
+  ckpt_path: dp_ckpt
+  lidar_seq_len: 4
+  sigma: 0.5
+  trajectory_imi_weight: 1.0
+  num_proposals: 100
+
+  use_back_view: True
+  fusion_layers: 3
+  progress_weight: 2.0
+
+  normalize_vocab_pos: True
+
+  camera_width: 2048
+  camera_height: 512
+  img_vert_anchors: 16
+  img_horz_anchors: 64
+  backbone_type: 'vov'
+
+  vov_ckpt: ${oc.env:OPENSCENE_DATA_ROOT}/models/dd3d_det_final.pth
+  lr_mult_backbone: 1.0
+
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    time_horizon: 4
+    interval_length: 0.5
+
+checkpoint_path: null
+lr: 1e-4
