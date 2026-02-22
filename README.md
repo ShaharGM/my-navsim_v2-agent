@@ -12,6 +12,7 @@ Create the conda environment from the provided file:
 conda env create -f environment.yml
 conda activate navsim
 ```
+(NOTE that this is an exact replica of the environment used by me, it expects you to run on Linux)
 
 Then install the package in editable mode:
 
