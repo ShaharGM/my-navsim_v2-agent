@@ -73,7 +73,7 @@ class ActionDiffusionAgent(AbstractAgent):
         lr: float = 1e-4,
         checkpoint_path: Optional[str] = None,
         scheduler: Optional[str] = None,
-        total_train_steps: int = 30000,
+        total_train_steps: int = 30000,         # used for the cosine and cycle LR schedulers
     ) -> None:
         super().__init__(trajectory_sampling=config.trajectory_sampling)
 

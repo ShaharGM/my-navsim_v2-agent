@@ -1,0 +1,15 @@
+hydra:
+  run:
+    dir: /tmp/navsim_test_output
+  output_subdir: null
+  searchpath:
+    - pkg://navsim.planning.script.config.common  # makes agent/ group discoverable
+  job:
+    chdir: False
+
+defaults:
+  - agent: action_diffusion_agent  # override on CLI: agent=<name>
+  - _self_
+
+# Target device. Override on CLI: device=cuda
+device: cuda

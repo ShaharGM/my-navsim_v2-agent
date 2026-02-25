@@ -57,7 +57,7 @@ config:
   camera_width: 2048
   camera_height: 512
   seq_len: 1              # 1 = most-recent frame only; set to 2 for temporal context
-  use_back_view: false    # set to true to add the rear panoramic view
+  use_back_view: true     # match GTRS baseline which always uses both front + rear
 
   # ── Perception backbone ────────────────────────────────────────────────────
   backbone_type: "timm"
@@ -84,6 +84,12 @@ config:
   num_diffusion_layers: 4
   num_diffusion_timesteps: 100
   num_inference_proposals: 64  # reduce to 16–32 for faster inference
+
+  # ── Noise / flow mode ─────────────────────────────────────────────────────
+  # 'ddpm'  → DDPM epsilon-prediction (num_diffusion_timesteps reverse steps)
+  # 'flow'  → Flow matching (num_flow_steps Euler ODE steps, t: 1→0)
+  noise_type: "ddpm"
+  num_flow_steps: 20
 
   # ── Unicycle action space ──────────────────────────────────────────────────
   internal_dt: 0.1         # integration time step [s]

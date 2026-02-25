@@ -32,7 +32,7 @@ class ActionDiffusionConfig:
     # the backbone; older frames are only kept in history for the physics model).
     seq_len: int = 1
     # Include the rear stitched view (l2 + b0 + r2) in addition to the front.
-    use_back_view: bool = False
+    use_back_view: bool = True
 
     # -------------------------------------------------------------------
     # Perception backbone
