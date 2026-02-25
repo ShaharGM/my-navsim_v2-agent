@@ -114,6 +114,19 @@ class ActionDiffusionConfig:
     pretrained_ckpt: str = ""
 
     # -------------------------------------------------------------------
+    # Noise scheduler type
+    # -------------------------------------------------------------------
+    # 'ddpm' : DDPM Markov-chain noise schedule (epsilon-prediction, original)
+    # 'flow' : Flow matching — linear probability paths, velocity prediction,
+    #          continuous time t ∈ [0, 1].  Training and inference are both
+    #          rewritten; the denoising transformer architecture is unchanged.
+    noise_type: str = "ddpm"
+    # Number of Euler integration steps used at inference time when
+    # noise_type='flow'.  Has no effect for noise_type='ddpm'.
+    # Fewer steps = faster inference; 20 is a good default.
+    num_flow_steps: int = 20
+
+    # -------------------------------------------------------------------
     # Training hyper-parameters
     # -------------------------------------------------------------------
     weight_decay: float = 0.0

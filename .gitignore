@@ -37,8 +37,8 @@ weights/
 
 # SLURM logs & error files
 logs_history/
-caching_errors_*
-caching_logs_*
+*_errors_*
+*_logs_*
 
 # Irrelevant navsim agents 
 navsim/agents/inversion_gtrs_dense/

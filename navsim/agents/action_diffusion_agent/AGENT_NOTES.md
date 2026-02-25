@@ -23,13 +23,16 @@ img_proj  (Linear: C → D)       status_encoder  (Linear+LN: 8 → D)
                    ▼
         context KV  (B, N_img+1, D)       ← positional bias added
                    │
-         ┌─────────┴───────────┐
-         │  TRAINING           │  INFERENCE
-         │                     │
-         │  add noise          │  sample N Gaussian noises
-         │  predict ε (MSE)    │  DDPM reverse chain (T steps)
-         │                     │  → N denoised action sequences
-         └─────────────────────┘
+         ┌─────────┴─────────────────────────────┐
+         │  TRAINING                             │  INFERENCE
+         │                                       │
+         │  DDPM: add noise at random int t      │  DDPM: sample N Gaussian noises
+         │         predict ε (MSE)               │         reverse chain (T steps)
+         │                                       │
+         │  Flow: interpolate at random float t  │  Flow: sample N Gaussian noises
+         │         predict velocity v (MSE)      │         Euler ODE t=1→0 (K steps)
+         │                                       │
+         └───────────────────────────────────────┘
                    │
      action_space.action_to_traj()   ← UnicycleAccelCurvature
                    │
@@ -38,6 +41,8 @@ img_proj  (Linear: C → D)       status_encoder  (Linear+LN: 8 → D)
          ↓ downsample ×5
         sparse trajectory (8 × 3)   ← returned to NAVSIM evaluator
 ```
+
+The noise mode is controlled by `config.noise_type` (`'ddpm'` or `'flow'`).
 
 The agent operates in a **unicycle action space** — all diffusion is done on
 (acceleration, curvature) pairs, not directly on positions.  
@@ -52,7 +57,7 @@ action_diffusion_agent/
 ├── __init__.py               public API exports
 ├── ad_config.py              ActionDiffusionConfig dataclass (all hyperparams)
 ├── ad_backbone.py            PerceptionBackbone (VoV + timm, → token sequence)
-├── ad_diffusion_head.py      DDPM noise schedule + DenoisingTransformer + physics
+├── ad_diffusion_head.py      DDPM / Flow Matching head + DenoisingTransformer + physics
 ├── ad_model.py               ActionDiffusionModel (wires backbone→context→head)
 ├── ad_features.py            Feature/target builders (NAVSIM AbstractFeatureBuilder)
 ├── ad_agent.py               ActionDiffusionAgent (NAVSIM AbstractAgent)
@@ -99,6 +104,8 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 | `accel_mean/std` | 0.057 / 1.12 | Z-score stats estimated on mini split |
 | `curv_mean/std` | 0.002 / 0.023 | Z-score stats estimated on mini split |
 | `pretrained_ckpt` | `""` | Checkpoint to load backbone+proj from (skips head) |
+| `noise_type` | `"ddpm"` | `"ddpm"` for DDPM or `"flow"` for flow matching |
+| `num_flow_steps` | 20 | Euler integration steps at inference time (flow only) |
 | `weight_decay` | 0.0 | Adam weight decay |
 | `dp_loss_weight` | 10.0 | Multiplier on the MSE diffusion loss |
 
@@ -136,51 +143,94 @@ Properties: `backbone.out_channels`, `backbone.num_tokens`
 
 ### 3.3 `ad_diffusion_head.py` — `ActionDiffusionHead`
 
+Supports two modes selected by `config.noise_type`:
+- `'ddpm'` — classic DDPM epsilon-prediction (default)
+- `'flow'` — flow matching with straight probability paths
+
+The denoising transformer architecture is **shared and unchanged** between both modes.
+
 #### Building blocks
 | Class | Purpose |
 |---|---|
-| `_FourierEncoder` | Log-spaced sin/cos encoding of scalars. dim=20, max_freq=100 |
+| `_FourierEncoder` | Log-spaced sin/cos encoding of scalars. Used in `_PerWaypointEncoder` (dim=20) and as the flow matching time embedding (dim=model_dim) |
 | `_RMSNorm` | Root-mean-square norm (no bias) |
-| `_SinusoidalPosEmb` | Integer timestep → (B, D) sinusoidal embedding |
+| `_SinusoidalPosEmb` | Integer timestep → (B, D) sinusoidal embedding. Used as DDPM time embedding |
 | `_build_mlp` | RMSNorm + SiLU depth-5 MLP |
 | `_PerWaypointEncoder` | (B,T,A) + timestep → (B,T,D); per-dim Fourier + MLP + LN |
 | `_DenoisingTransformer` | Pre-LN TransformerDecoder; action queries cross-attend context KV |
 
 #### `_DenoisingTransformer`
-- Input:  `noise (B,T,A)`, `timesteps (B,)`, `context (B,L,D)`
-- Time token — sinusoidal embedding appended to the front of the context KV: `(B, L+1, D)`
+- Input:  `noise_or_xt (B,T,A)`, `timestep (B,)`, `context (B,L,D)`
+- `timestep` is an **integer** (DDPM) or a **continuous float in [0,1]** (flow matching)
+- `noise_type` is passed at construction to select the time embedding module:
+  - DDPM → `_SinusoidalPosEmb(d_model)`
+  - Flow → `_FourierEncoder(dim=d_model)`
+- Time token prepended to the context KV: `(B, L+1, D)`
 - Learned positional biases: `action_pos (1,T,D)` on query side, `cond_pos (1,L+1,D)` on KV side
 - Architecture: Pre-LN multi-head cross-attention → Pre-LN FFN (GeLU), N layers
-- Output: predicted noise `(B, T, A)`
+- Output: predicted noise ε (DDPM) or predicted velocity v (flow): `(B, T, A)`
 
-#### `ActionDiffusionHead.compute_loss()` — training
+#### `_get_gt_actions()` — shared helper
+Extracts normalised (accel, curvature) actions from the dense GT trajectory. Called by both `_ddpm_compute_loss` and `_flow_compute_loss` to avoid duplicating the trajectory-inversion logic.
+
+#### `compute_loss()` — training dispatcher
+Dispatches to `_ddpm_compute_loss` or `_flow_compute_loss` based on `config.noise_type`.
+
+**DDPM (`_ddpm_compute_loss`)**:
 ```python
-# 1. Convert GT dense trajectory → normalised (accel, curvature) actions
-gt_actions = action_space.traj_to_action(gt_xyz, gt_rot, hist_xyz, hist_rot, t0_states)
-
-# 2. DDPM forward process
+# 1. GT actions via _get_gt_actions() → (B, 40, 2)
+# 2. DDPM forward process: add noise at a random integer timestep
 noise = torch.randn_like(gt_actions)
-timesteps = randint(0, T, (B,))
+timesteps = randint(0, T, (B,))  # integer
 noisy_actions = noise_scheduler.add_noise(gt_actions, noise, timesteps)
-
 # 3. Predict noise; MSE loss
 pred_noise = denoiser(noisy_actions, timesteps, context)
 return F.mse_loss(pred_noise, noise)
 ```
 
-#### `ActionDiffusionHead.forward()` — inference
+**Flow matching (`_flow_compute_loss`)**:
+```python
+# 1. GT actions via _get_gt_actions() → x0 (B, 40, 2)
+# 2. Sample continuous time t ~ Uniform[0, 1], one per sample
+t = torch.rand(B, device=device)          # float in [0, 1]
+# 3. Linear interpolation: x_t = (1-t)*x0 + t*noise
+noise = torch.randn_like(x0)
+x_t = (1 - t[:,None,None]) * x0 + t[:,None,None] * noise
+# 4. Ground-truth velocity
+target_v = noise - x0
+# 5. Predict velocity; MSE loss
+pred_v = denoiser(x_t, t, context)        # t is (B,) float
+return F.mse_loss(pred_v, target_v)
+```
+
+#### `forward()` — inference dispatcher
+Dispatches to `_ddpm_forward` or `_flow_forward` based on `config.noise_type`.
+
+**DDPM (`_ddpm_forward`)**:
 ```python
 # 1. Start from pure Gaussian noise (B*N proposals)
 noise = randn(B*N, 40, 2)
-
 # 2. Full DDPM reverse chain
 scheduler.set_timesteps(T, device)
 for t in scheduler.timesteps:
     pred_eps = denoiser(noise, t.expand(B*N), ctx)
     noise = scheduler.step(pred_eps, t, noise).prev_sample
+# 3. action_to_traj → dense trajectory → sparse trajectory
+return {"dp_pred": (B,N,8,3), "pred_actions": (B,N,40,2)}
+```
 
-# 3. action_to_traj → dense 40-step trajectory
-# 4. Downsample to 8 sparse steps (indices 4, 9, 14, ..., 39)
+**Flow matching (`_flow_forward`)**:
+```python
+# 1. Start from pure Gaussian noise at t=1 (B*N proposals)
+x = randn(B*N, 40, 2)
+# 2. Euler integration from t=1 → t=0 (num_flow_steps uniform steps)
+n_steps = cfg.num_flow_steps;  dt = 1.0 / n_steps
+for i in range(n_steps, 0, -1):
+    t_val = i / n_steps                         # float in (0, 1]
+    t_b = torch.full((B*N,), t_val, ...)
+    v = denoiser(x, t_b, ctx)                   # predicted velocity
+    x = x - dt * v                               # Euler step toward t=0
+# 3. action_to_traj → dense trajectory → sparse trajectory
 return {"dp_pred": (B,N,8,3), "pred_actions": (B,N,40,2)}
 ```
 
@@ -344,11 +394,24 @@ agent.config.freeze_backbone: true   # optional — freeze the warm-started enco
 ```
 Keys matching `"diffusion_head"` are always skipped so the head trains from scratch.
 
-### 4.4 Reducing inference cost
+### 4.4 Flow matching mode
+
+```bash
+# Flow matching — faster convergence, cleaner trajectories
+python navsim/planning/script/run_training.py \
+  agent=action_diffusion_agent \
+  agent.config.noise_type=flow \
+  agent.config.num_flow_steps=20
+```
+
+Note: DDPM checkpoints and flow matching checkpoints are **not interchangeable** — the denoiser output is epsilon vs velocity, and the time embedding is different. Always train from scratch when switching `noise_type`.
+
+### 4.5 Reducing inference cost
 
 ```yaml
 agent.config.num_inference_proposals: 16   # was 64
-agent.config.num_diffusion_timesteps: 50   # was 100 (also affects training)
+agent.config.num_diffusion_timesteps: 50   # was 100 (also affects DDPM training)
+agent.config.num_flow_steps: 10            # was 20 (flow only; does not affect training)
 ```
 
 ---
@@ -392,10 +455,15 @@ img_proj output:      (B, N_img, D)           D = model_dim = 256
 status token:         (B, 1, D)
 context KV:           (B, 1025, D)            = 1024 + 1
 
-# Diffusion
+# Diffusion (DDPM)
 noisy_actions:        (B, 40, 2)              (accel, curvature), z-score normed
 pred_noise:           (B, 40, 2)
 t_batch:              (B,)                    integer timestep 0…T-1
+
+# Diffusion (flow matching)
+x_t:                  (B, 40, 2)              linearly interpolated actions
+pred_velocity:        (B, 40, 2)              predicted velocity v = ε - x0
+t_batch:              (B,)                    continuous float in [0, 1]
 
 # Output
 dp_pred:              (B, N, 8, 3)            [x, y, heading] ego-relative
@@ -405,147 +473,70 @@ interpolated_traj:    (B, 40, 3)              GT used for diffusion loss
 
 ---
 
-## 7. Switching the Noise Scheduler
+## 7. Noise Mode Reference
 
-Currently the agent uses **DDPM** (`DDPMScheduler` from `diffusers`).  
-Two upgrade paths were discussed; here is what each requires:
+The head supports two modes, selected by `config.noise_type`.
 
 ---
 
-### 7.1 DDPM → DDIM (easy, ~15 min)
+### 7.1 DDPM (default)
+
+Classic epsilon-prediction with a Markov noising chain.
+
+| Aspect | Detail |
+|---|---|
+| Training target | Predict added noise ε |
+| Training timestep | Integer t ~ Uniform{0, …, T-1}, `T = num_diffusion_timesteps` |
+| Forward process | `x_t = sqrt(ᾱ_t)·x₀ + sqrt(1-ᾱ_t)·ε` (cosine schedule) |
+| Inference | Full Markov reverse chain, T steps using `DDPMScheduler` |
+| Time embedding | `_SinusoidalPosEmb` (integer input) |
+| Scheduler object | `DDPMScheduler` from `diffusers` |
+| Key config fields | `num_diffusion_timesteps` (default 100) |
+
+### 7.2 Flow Matching (`noise_type='flow'`)
+
+**Status: implemented.** Enabled by setting `config.noise_type = 'flow'`.
+
+Straight probability paths (linear interpolation between data and noise) instead of the Markov chain. The denoiser architecture (`_DenoisingTransformer`) is **identical** between both modes — only the time embedding and the training/inference loops differ.
+
+| Aspect | Detail |
+|---|---|
+| Training target | Predict velocity `v = ε - x₀` |
+| Training timestep | Continuous t ~ Uniform[0, 1] |
+| Forward process | `x_t = (1-t)·x₀ + t·ε` (linear interpolation) |
+| Inference | Euler ODE integration from t=1 → t=0, `num_flow_steps` uniform steps |
+| Time embedding | `_FourierEncoder(dim=model_dim)` (continuous float input) |
+| Scheduler object | None (no `diffusers` dependency at all) |
+| Key config fields | `num_flow_steps` (default 20) |
+
+#### Why flow matching?
+- Straight trajectories in probability space → faster convergence.
+- No DDPM noise schedule to tune.
+- Inference quality scales smoothly with step count; 10–20 steps is typically sufficient.
+
+#### Checkpoint compatibility
+DDPM and flow matching checkpoints are **not interchangeable** — the denoiser output semantics (ε vs v) and the time embedding differ. Always train from scratch when switching `noise_type`.
+
+---
+
+### 7.3 Future: DDIM (easy upgrade from DDPM, ~15 min)
 
 DDIM shares the **exact same training objective** as DDPM (epsilon-prediction MSE).  
 Only inference changes — a non-Markovian shortcut path that allows ~10× fewer steps.
 
-**`ad_config.py`**  
-Add one field:
+**`ad_config.py`** — add:
 ```python
-num_inference_steps: int = 10   # DDIM inference steps (separate from training T)
+num_inference_steps: int = 10
 ```
 
 **`ad_diffusion_head.py`**  
-1. Change import: `from diffusers import DDIMScheduler`
-2. Change scheduler init:
-   ```python
-   self.noise_scheduler = DDIMScheduler(
-       num_train_timesteps=config.num_diffusion_timesteps,
-       beta_start=0.0001,
-       beta_end=0.02,
-       beta_schedule="squaredcos_cap_v2",
-       clip_sample=True,
-       clip_sample_range=5.0,
-       prediction_type="epsilon",
-   )
-   ```
-3. In `compute_loss()`: **no changes** — training is identical.
-4. In `forward()`, change one line:
-   ```python
-   # Before (DDPM):
-   self.noise_scheduler.set_timesteps(cfg.num_diffusion_timesteps, device=device)
-   # After (DDIM):
-   self.noise_scheduler.set_timesteps(cfg.num_inference_steps, device=device)
-   ```
+1. Change import: `from diffusers import DDIMScheduler`  
+2. Change scheduler init to `DDIMScheduler(...)` with the same kwargs.  
+3. `compute_loss()` — no changes.  
+4. In `_ddpm_forward()` change one line: `scheduler.set_timesteps(cfg.num_inference_steps, device=device)`.  
    The `scheduler.step()` call inside the loop is identical — `DDIMScheduler` has the same API.
 
-**Hydra YAML** — add `num_inference_steps: 10` under `config:`.
-
-Net effect: training unchanged, inference 10× faster (10 steps vs 100), slight reduction in trajectory diversity.
-
----
-
-### 7.2 DDPM → Flow Matching (deeper, ~80 lines)
-
-Flow matching uses **straight probability paths** (linear interpolation between data and noise) instead of the Markov chain. The denoiser architecture (`_DenoisingTransformer`) is **completely unchanged**.
-
-#### Training objective changes
-
-DDPM trains a noise predictor: predict $\epsilon$ from $x_t = \sqrt{\bar\alpha_t} x_0 + \sqrt{1-\bar\alpha_t} \epsilon$.
-
-Flow matching trains a **velocity** predictor: given $x_t = (1-t) x_0 + t \epsilon$, predict $v = \epsilon - x_0$.
-
-The continuous time variable $t \in [0,1]$ replaces the integer timestep index.
-
-#### Changes required
-
-**`ad_config.py`**
-- Remove: `beta_start`, `beta_end`, `beta_schedule`, `variance_type`, `clip_sample` (scheduler fields, not present as explicit config fields but they're in the head init)
-- Rename `num_diffusion_timesteps` → `num_flow_steps` (inference only, typically 20–50); or keep both (train T unused in FM, only N inference steps matters)
-
-**`ad_diffusion_head.py`** — all changes concentrated here:
-
-1. Remove `DDPMScheduler` import. No `diffusers` scheduler needed at all.
-
-2. Rewrite `compute_loss()`:
-   ```python
-   def compute_loss(self, context, gt_traj_dense, features):
-       B, device = context.shape[0], context.device
-       
-       # GT actions (same as before)
-       gt_xyz, gt_rot = self._se2_to_xyz_rot(gt_traj_dense.float())
-       hist_xyz, hist_rot = self._build_history(features)
-       v0 = features["status_feature"][:, 4]
-       x0 = self.action_space.traj_to_action(gt_xyz, gt_rot,
-                                              hist_xyz, hist_rot, {"v": v0})  # (B,40,2)
-       
-       # Sample t uniformly in [0, 1], one value per sample
-       t = torch.rand(B, device=device)                       # (B,)
-       
-       # Linear interpolation: x_t = (1-t)*x0 + t*noise
-       noise = torch.randn_like(x0)
-       t_exp = t[:, None, None]                               # (B,1,1) for broadcast
-       x_t = (1 - t_exp) * x0 + t_exp * noise
-       
-       # Target velocity: v = noise - x0
-       target_v = noise - x0
-       
-       # Predict velocity; timestep is now continuous float in [0,1]
-       # _SinusoidalPosEmb works with integers; replace with _FourierEncoder for t
-       pred_v = self.denoiser(x_t, t, context)  # t is (B,) float
-       return F.mse_loss(pred_v, target_v)
-   ```
-
-3. Rewrite `forward()` (inference) — simple Euler ODE integration:
-   ```python
-   def forward(self, context, features):
-       cfg = self.config
-       B, N = context.shape[0], cfg.num_inference_proposals
-       ctx = context.repeat_interleave(N, dim=0)
-       # ...setup hist/v0 as before...
-       
-       x = torch.randn(B*N, cfg.internal_horizon, cfg.action_dim, ...)
-       n_steps = cfg.num_flow_steps              # e.g. 20
-       dt = 1.0 / n_steps
-       for i in range(n_steps, 0, -1):
-           t_val = i / n_steps
-           t_b = torch.full((B*N,), t_val, device=device)
-           v = self.denoiser(x, t_b, ctx)
-           x = x - dt * v                        # Euler step: integrate from t=1 → 0
-       pred_actions_norm = x
-       # ...action_to_traj + downsample as before...
-   ```
-
-4. Timestep encoding — `_SinusoidalPosEmb` currently takes integer timesteps.  
-   For flow matching, $t$ is a continuous float in [0,1].  
-   The `_FourierEncoder` class already handles this (it multiplies by frequencies).  
-   Change `_DenoisingTransformer` to use `_FourierEncoder(dim=model_dim)` instead of  
-   `_SinusoidalPosEmb(dim=model_dim)` for the time token.
-
-**`ad_model.py`, `ad_agent.py`, `ad_features.py`** — no changes needed.
-
-#### Summary comparison
-
-| | DDIM | Flow Matching |
-|---|---|---|
-| `compute_loss()` | unchanged | full rewrite (linear interp + velocity target) |
-| Inference loop | 1 line (step count) | full rewrite (Euler ODE, no scheduler) |
-| Timestep type | integer 0…T | continuous float 0…1 |
-| `_SinusoidalPosEmb` | unchanged | replace with `_FourierEncoder` |
-| `_DenoisingTransformer` | unchanged | unchanged |
-| `ad_model.py` | unchanged | unchanged |
-| Typical inference steps | 10–20 | 10–50 |
-| Relative effort | ~15 min | ~1–2 hours |
-
-Flow matching typically converges faster and produces straighter, more consistent trajectory rollouts. If training time matters more than code simplicity, it's worth doing.
+Net effect: training unchanged, inference 10× faster, slight reduction in trajectory diversity.
 
 ---
 
@@ -568,3 +559,7 @@ Flow matching typically converges faster and produces straighter, more consisten
 7. **Action normalisation stats** (`accel_mean/std`, `curv_mean/std`) were estimated on the mini training split. If you train on a significantly different data distribution, re-estimate them — a large mismatch will slow convergence.
 
 8. **Inference proposal selection** is random (uniform over N proposals). For evaluation you may want to pick the trajectory closest to the ego's current speed/heading, or use a learned scoring head.
+
+9. **Flow matching time embedding uses `_FourierEncoder`, not `_SinusoidalPosEmb`.** `_SinusoidalPosEmb` is designed for integer inputs and produces near-zero output for small floats in [0,1]. Always check that `_DenoisingTransformer` was constructed with `noise_type='flow'` when loading a flow matching checkpoint.
+
+10. **`noise_type` is baked into the model at construction time** (it selects the time embedding class). A DDPM-trained checkpoint cannot be used with `noise_type='flow'` or vice versa — the `denoiser.time_emb` weights would be incompatible.

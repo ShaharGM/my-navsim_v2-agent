@@ -26,6 +26,6 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         agent.config.freeze_backbone=True \
         agent.config.num_inference_proposals=100 \
         agent.config.num_diffusion_layers=5 \
-        cache_path="${NAVSIM_EXP_ROOT}/training_cache/" \
+        cache_path="${NAVSIM_EXP_ROOT}/training_cache_navmini/" \
         use_cache_without_dataset=True \
         force_cache_computation=False
