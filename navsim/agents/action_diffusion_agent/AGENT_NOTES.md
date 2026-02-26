@@ -10,11 +10,11 @@ Intended audience: future sessions with an AI assistant, or any developer pickin
 `ActionDiffusionAgent` is a camera-based autonomous driving agent for the **NAVSIM** evaluation framework. It follows a diffusion-policy architecture:
 
 ```
-front panoramic image (l0 + f0 + r0)
+front panoramic image (l0 + f0 + r0)  [+ rear view when use_back_view=True]
     │
     ▼
-PerceptionBackbone  (resnet50 / any timm / VoV V-99-eSE)
-    │  (B, 3, H, W) → (B, N_img, C)
+BackboneBase subclass  (PoolBackbone: timm/VoV  |  BEVBackbone: VoV+BEV fusion)
+    │  features dict → (B, N_img, C)   N_img and C depend on backbone
     ▼
 img_proj  (Linear: C → D)       status_encoder  (Linear+LN: 8 → D)
     │                                    │
@@ -56,13 +56,17 @@ This gives the head a physically grounded, lower-dimensional signal to learn.
 action_diffusion_agent/
 ├── __init__.py               public API exports
 ├── ad_config.py              ActionDiffusionConfig dataclass (all hyperparams)
-├── ad_backbone.py            PerceptionBackbone (VoV + timm, → token sequence)
 ├── ad_diffusion_head.py      DDPM / Flow Matching head + DenoisingTransformer + physics
 ├── ad_model.py               ActionDiffusionModel (wires backbone→context→head)
 ├── ad_features.py            Feature/target builders (NAVSIM AbstractFeatureBuilder)
 ├── ad_agent.py               ActionDiffusionAgent (NAVSIM AbstractAgent)
 ├── ad_callback.py            TensorBoard visualisation callback
-└── AGENT_NOTES.md            ← this file
+├── AGENT_NOTES.md            ← this file
+└── backbones/
+    ├── __init__.py           build_backbone() factory + __all__
+    ├── base.py               BackboneBase abstract class (ABC + nn.Module)
+    ├── pool_backbone.py      PoolBackbone — timm / VoV CNN + AdaptiveAvgPool2d
+    └── bev_backbone.py       BEVBackbone — VoVNet + cross-attention BEV fusion
 ```
 
 The Hydra config lives outside the package:
@@ -83,14 +87,18 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 | `trajectory_sampling` | 4 s @ 0.5 s | Output waypoint spec (→ NAVSIM evaluator) |
 | `camera_width/height` | 2048 × 512 | Stitched panoramic image resolution |
 | `seq_len` | 1 | Historical camera frames to load |
-| `use_back_view` | False | Include rear panorama (l2+b0+r2) |
-| `backbone_type` | `"timm"` | `"timm"` or `"vov"` |
-| `timm_model_name` | `"resnet50"` | Any `timm.create_model` identifier |
-| `timm_pretrained` | True | Load ImageNet weights via timm hub |
-| `vov_ckpt` | `""` | Path to VoV checkpoint (only for `backbone_type="vov"`) |
+| `use_back_view` | True | Include rear panorama (l2+b0+r2) |
+| `backbone_type` | `"timm"` | `"timm"`, `"vov"`, or `"bev"` |
+| `timm_model_name` | `"resnet50"` | Any `timm.create_model` identifier (`"timm"` only) |
+| `timm_pretrained` | True | Load ImageNet weights via timm hub (`"timm"` only) |
+| `vov_ckpt` | `""` | Path to VoV checkpoint (`"vov"` and `"bev"` backbones) |
+| `bev_ckpt` | `""` | Path to full BEVBackbone checkpoint (`"bev"` only) |
 | `freeze_backbone` | True | Freeze backbone during training |
-| `img_vert_anchors` | 16 | Spatial pooling height |
-| `img_horz_anchors` | 64 | Spatial pooling width |
+| `bev_fusion_layers` | 3 | TransformerEncoder depth inside BEV fusion (`"bev"` only) |
+| `bev_img_vert_anchors` | 8 | VoV pool height per camera fed into BEV fusion (`"bev"` only) |
+| `bev_img_horz_anchors` | 16 | VoV pool width per camera fed into BEV fusion (`"bev"` only) |
+| `img_vert_anchors` | 16 | Spatial pool height — `"timm"` and `"vov"` only |
+| `img_horz_anchors` | 64 | Spatial pool width — `"timm"` and `"vov"` only |
 | `model_dim` | 256 | D — transformer/projection dimension |
 | `ffn_dim` | 1024 | Feed-forward inner dim in denoising transformer |
 | `num_heads` | 8 | Attention heads |
@@ -115,11 +123,40 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 
 ---
 
-### 3.2 `ad_backbone.py` — `PerceptionBackbone`
+### 3.2 `backbones/` — Perception Backbone Package
+
+The backbone is now a proper subpackage with an abstract base class and two concrete implementations. `ActionDiffusionModel` only ever calls `build_backbone(config)` and then uses the returned object through the `BackboneBase` interface — it has no knowledge of which backbone is active.
+
+#### `base.py` — `BackboneBase` (ABC + nn.Module)
+
+Every backbone must implement:
+
+| Property / method | Type | Description |
+|---|---|---|
+| `num_tokens` | `int` (property) | Total context tokens returned per sample |
+| `out_channels` | `int` (property) | Channel dimension of each token |
+| `forward(features)` | `(B, num_tokens, out_channels)` | Receives the raw feature dict, returns flat token tensor |
+
+The `features` dict is passed through unchanged, so each backbone can read whichever keys it needs.
+
+#### `__init__.py` — `build_backbone(config)` factory
+
+```python
+if config.backbone_type in ("timm", "vov"):
+    return PoolBackbone(config)
+elif config.backbone_type == "bev":
+    return BEVBackbone(config)
+```
+
+#### `pool_backbone.py` — `PoolBackbone`
+
+Single CNN encoder + `AdaptiveAvgPool2d` spatial pooling.
 
 ```
-Input:  (B, 3, H, W)
-Output: (B, N, C)   where N = img_vert_anchors × img_horz_anchors
+Input keys: "camera_feature" (B,T,3,H,W)  +  optionally "camera_feature_back"
+Output:     (B, N, C)
+  N = img_vert_anchors × img_horz_anchors        (× 2 if use_back_view)
+  C = encoder output channels
 ```
 
 **timm path:**
@@ -127,17 +164,34 @@ Output: (B, N, C)   where N = img_vert_anchors × img_horz_anchors
 self._encoder = timm.create_model(name, pretrained=True, features_only=True, out_indices=(-1,))
 feat = self._encoder(image)[-1]   # always a list; take last
 ```
-Channel count is probed once at init with a zero-tensor dry run on CPU.
+Channel count is probed once at init with a CPU zero-tensor dry run.
 
 **VoV path:**
 ```python
 self._encoder = VoVNet("V-99-eSE", out_features=["stage4","stage5"], ...)
-feat = self._encoder(image)[-1]   # also a plain list; 1024 channels
+feat = self._encoder(image)[-1]   # plain list; 1024 channels
 ```
 
-Both are followed by `AdaptiveAvgPool2d((vert, horz))` → flatten to `(B, N, C)`.
+Both paths: `AdaptiveAvgPool2d((vert, horz))` → `flatten(2).permute(0,2,1)` → `(B, V×H, C)`.
 
-Properties: `backbone.out_channels`, `backbone.num_tokens`
+#### `bev_backbone.py` — `BEVBackbone`
+
+VoVNet encoder + cross-attention BEV fusion. Architecture matches `HydraBackboneBEV` from GTRS so pretrained GTRS backbone checkpoints can be loaded directly (attribute names are intentionally identical).
+
+```
+Input keys: "camera_feature"  (B,T,3,H,W)  — front stitched view
+            "camera_feature_back"  (B,T,3,H,W)  — rear stitched view
+Output:     (B, 64, 1024)   — 64 BEV query tokens (8×8 grid), 1024 channels
+```
+
+Internal pipeline:
+1. VoV encoder → `AdaptiveAvgPool2d((bev_img_vert_anchors, bev_img_horz_anchors))` → `(B, P, 1024)` per camera, where `P = bev_img_vert_anchors × bev_img_horz_anchors`.
+2. Concat front + back → `(B, 2P, 1024)`.
+3. Concat with learnable BEV queries `(B, 64, 1024)` → `(B, 2P+64, 1024)`.
+4. Add positional embeddings, run `TransformerEncoder` (`bev_fusion_layers` layers, 16 heads).
+5. Return only the last 64 positions (BEV query outputs): `tokens[:, 2P:]`.
+
+Checkpoint loading (`bev_ckpt`): strips `"agent.model.backbone."` / `"model.backbone."` / `"backbone."` prefixes.
 
 ---
 
@@ -245,18 +299,24 @@ Default `seq_len=1` gives 3 history frames + 1 current = `N_hist=3`, so `hist_st
 
 ### 3.4 `ad_model.py` — `ActionDiffusionModel`
 
-Wires everything together:
+Wires everything together. The model is **completely agnostic** to which backbone is active — it sizes all downstream layers from `backbone.num_tokens` and `backbone.out_channels` at init time.
 
 ```
-context_len = img_vert_anchors × img_horz_anchors × (2 if use_back_view else 1)  +  1
-           = 16×64 × 1  +  1  =  1025  (default)
+context_len = backbone.num_tokens + 1
+
+# Default (timm/vov, use_back_view=True):
+#   16×64 × 2  +  1  =  2049
+# BEV backbone:
+#   64  +  1  =  65
 ```
+
+**`build_backbone(config)`** (called at init) returns the correct `BackboneBase` subclass; the model stores it as `self.backbone` and never inspects it further.
 
 **Context building (`_build_context`):**
-1. `backbone(img_front)` → `(B, N, C)` → `img_proj` → `(B, N, D)`
-2. Optional: same for rear view → `cat` along dim 1 → `(B, 2N, D)`  
-3. `status_encoder(status)` → `(B, 1, D)` → unsqueeze
-4. `cat([img_tokens, status_tok], dim=1)` → `(B, L, D)`
+1. `self.backbone(features)` → `(B, N, C)`   *(backbone owns all image extraction)*
+2. `img_proj` (Linear: C → D) → `(B, N, D)`
+3. `status_encoder(status)` → `(B, 1, D)`
+4. `cat([img_tokens, status_tok], dim=1)` → `(B, N+1, D)`
 5. `+ pos_embedding.weight` → learnable positional bias
 
 **Freeze / unfreeze:**
@@ -368,6 +428,14 @@ python navsim/planning/script/run_training.py \
   agent.config.vov_ckpt=/path/to/dd3d_det_final.pth \
   agent.config.freeze_backbone=true
 
+# BEV backbone (VoVNet + cross-attention BEV fusion)
+python navsim/planning/script/run_training.py \
+  agent=action_diffusion_agent \
+  agent.config.backbone_type=bev \
+  agent.config.vov_ckpt=/path/to/dd3d_det_final.pth \
+  agent.config.bev_ckpt=/path/to/gtrs_backbone.ckpt \
+  agent.config.freeze_backbone=true
+
 # With cosine LR schedule
 python navsim/planning/script/run_training.py \
   agent=action_diffusion_agent \
@@ -449,11 +517,11 @@ camera_feature:       (B, seq_len, 3, H, W)   H=512, W=2048
 status_feature:       (B, 8)                  [cmd(4), vx, vy, ax, ay]
 hist_status_feature:  (B, N_hist*7)           N_hist = seq_len-1+3 = 3 typically
 
-# Internal context
-backbone tokens:      (B, N_img, C)           N_img = 16×64 = 1024
+# Internal context  (defaults: timm/vov, use_back_view=True)
+backbone tokens:      (B, N_img, C)           N_img = 16×64×2 = 2048  (or 64 for BEV)
 img_proj output:      (B, N_img, D)           D = model_dim = 256
 status token:         (B, 1, D)
-context KV:           (B, 1025, D)            = 1024 + 1
+context KV:           (B, 2049, D)            = 2048 + 1  (or 65 for BEV backbone)
 
 # Diffusion (DDPM)
 noisy_actions:        (B, 40, 2)              (accel, curvature), z-score normed
@@ -542,24 +610,26 @@ Net effect: training unchanged, inference 10× faster, slight reduction in traje
 
 ## 8. Key Design Decisions & Gotchas
 
-1. **VoVNet returns a Python `list`, not an OrderedDict.** Use `feat_list[-1]`, not dictionary access.
+1. **Backbone abstraction boundary.** `ActionDiffusionModel` never imports or inspects any concrete backbone class. It calls `build_backbone(config)` once at init, reads `backbone.num_tokens` and `backbone.out_channels` to size `img_proj` and `pos_embedding`, then calls `backbone(features)` during forward. Adding a new backbone type only requires implementing `BackboneBase` and registering it in `build_backbone()`.
 
-2. **timm backbone probe:** `PerceptionBackbone.__init__` runs a CPU dry-run with a zero tensor to detect the output channel count. This is a one-time cost but will appear during model instantiation.
+2. **VoVNet returns a Python `list`, not an OrderedDict.** Use `feat_list[-1]`, not dictionary access. Both `PoolBackbone` and `BEVBackbone` handle this internally.
 
-3. **`model.train()` override:** PyTorch's `train()` is overridden in `ActionDiffusionModel` to force `backbone.eval()` when `freeze_backbone=True`. Without this, every Lightning `model.train()` call at epoch start would unfreeze frozen BatchNorm stats.
+3. **timm backbone probe:** `PoolBackbone.__init__` runs a CPU dry-run with a zero tensor to detect the output channel count. This is a one-time cost but will appear during model instantiation.
 
-4. **`trajectory` is a zero placeholder during training.** NAVSIM's `AgentLightningModule` calls `forward()` then `compute_loss()`. The trajectory output is only used by the evaluator, never by the training loop. Returning zeros avoids wasting inference compute during training.
+4. **`model.train()` override:** PyTorch's `train()` is overridden in `ActionDiffusionModel` to force `backbone.eval()` when `freeze_backbone=True`. Without this, every Lightning `model.train()` call at epoch start would unfreeze frozen BatchNorm stats.
 
-5. **`context_len + 1` in the denoiser.** `_DenoisingTransformer.cond_pos` is sized `(1, context_len+1, D)` because the sinusoidal time token is **prepended** to the context KV at every forward pass, making the effective sequence length `L+1`.
+5. **`trajectory` is a zero placeholder during training.** NAVSIM's `AgentLightningModule` calls `forward()` then `compute_loss()`. The trajectory output is only used by the evaluator, never by the training loop. Returning zeros avoids wasting inference compute during training.
 
-6. **Two checkpoint concepts:**
+6. **`context_len + 1` in the denoiser.** `_DenoisingTransformer.cond_pos` is sized `(1, context_len+1, D)` because the sinusoidal time token is **prepended** to the context KV at every forward pass, making the effective sequence length `L+1`.
+
+7. **Two checkpoint concepts:**
    - `config.pretrained_ckpt` → backbone warm-start only (strips diffusion_head keys)
    - `agent.checkpoint_path` → full agent restore (used in `initialize()`)
 
-7. **Action normalisation stats** (`accel_mean/std`, `curv_mean/std`) were estimated on the mini training split. If you train on a significantly different data distribution, re-estimate them — a large mismatch will slow convergence.
+8. **Action normalisation stats** (`accel_mean/std`, `curv_mean/std`) were estimated on the mini training split. If you train on a significantly different data distribution, re-estimate them — a large mismatch will slow convergence.
 
-8. **Inference proposal selection** is random (uniform over N proposals). For evaluation you may want to pick the trajectory closest to the ego's current speed/heading, or use a learned scoring head.
+9. **Inference proposal selection** is random (uniform over N proposals). For evaluation you may want to pick the trajectory closest to the ego's current speed/heading, or use a learned scoring head.
 
-9. **Flow matching time embedding uses `_FourierEncoder`, not `_SinusoidalPosEmb`.** `_SinusoidalPosEmb` is designed for integer inputs and produces near-zero output for small floats in [0,1]. Always check that `_DenoisingTransformer` was constructed with `noise_type='flow'` when loading a flow matching checkpoint.
+10. **Flow matching time embedding uses `_FourierEncoder`, not `_SinusoidalPosEmb`.** `_SinusoidalPosEmb` is designed for integer inputs and produces near-zero output for small floats in [0,1]. Always check that `_DenoisingTransformer` was constructed with `noise_type='flow'` when loading a flow matching checkpoint.
 
-10. **`noise_type` is baked into the model at construction time** (it selects the time embedding class). A DDPM-trained checkpoint cannot be used with `noise_type='flow'` or vice versa — the `denoiser.time_emb` weights would be incompatible.
+11. **`noise_type` is baked into the model at construction time** (it selects the time embedding class). A DDPM-trained checkpoint cannot be used with `noise_type='flow'` or vice versa — the `denoiser.time_emb` weights would be incompatible.
