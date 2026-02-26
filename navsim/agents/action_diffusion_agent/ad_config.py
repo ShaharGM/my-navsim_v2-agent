@@ -38,25 +38,41 @@ class ActionDiffusionConfig:
     # Perception backbone
     # -------------------------------------------------------------------
     # Select the visual backbone:
-    #   'timm' → any model identifier accepted by `timm.create_model`,
-    #              e.g. "resnet50", "convnext_small_in22ft1k",
-    #                   "vit_base_patch16_224"            (default)
-    #   'vov'  → VoVNet V-99-eSE (used in the GTRS pipeline); requires
-    #              a pretrained checkpoint via `vov_ckpt`
+    #   'timm'  →  any model identifier accepted by `timm.create_model`,
+    #               e.g. "resnet50", "convnext_small_in22ft1k",
+    #                    "vit_base_patch16_224"            (default)
+    #   'vov'   →  VoVNet V-99-eSE (used in the GTRS pipeline); requires
+    #               a pretrained checkpoint via `vov_ckpt`
+    #   'bev'   →  BEVBackbone: VoVNet + cross-attention BEV fusion.
+    #               Always consumes front + back cameras internally and
+    #               returns 64 BEV tokens (8×8 query grid) at 1024 channels.
+    #               Requires `vov_ckpt`.  Optionally set `bev_ckpt` to load
+    #               the full backbone state (fusion transformer, BEV queries).
     backbone_type: str = "timm"
     timm_model_name: str = "resnet50"
     timm_pretrained: bool = True          # load ImageNet weights via timm hub
-    vov_ckpt: str = ""                    # path to VoV checkpoint (vov only)
+    vov_ckpt: str = ""                    # path to VoV checkpoint (vov + bev)
+    bev_ckpt: str = ""                    # path to full BEVBackbone checkpoint (bev only)
 
-    # When True the entire backbone (and the linear projection layer that
-    # maps its channels to model_dim) is frozen.  Only the ego-status encoder,
-    # the positional embedding, and the diffusion head are updated.
-    # When False every parameter is trainable.
+    # When True all parameters inside self.backbone are frozen.
+    # Only the ego-status encoder, positional embedding, and diffusion head
+    # are updated.  When False every parameter is trainable.
     freeze_backbone: bool = True
+
+    # -------------------------------------------------------------------
+    # BEV backbone settings  (only used when backbone_type='bev')
+    # -------------------------------------------------------------------
+    # bev_img_vert_anchors × bev_img_horz_anchors is the VoV spatial pool
+    # size per camera view, i.e. the image tokens fed INTO the fusion
+    # transformer — NOT the output size.  The BEV output is always 8×8 = 64.
+    bev_fusion_layers: int = 3        # TransformerEncoder depth
+    bev_img_vert_anchors: int = 8     # VoV pool height per camera (e.g. 8×16 = 128 tokens)
+    bev_img_horz_anchors: int = 16    # VoV pool width  per camera
 
     # -------------------------------------------------------------------
     # Spatial pooling — defines how many image tokens are produced
     # -------------------------------------------------------------------
+    # Used only for backbone_type='timm' and 'vov'.
     # The backbone's last feature map is pooled to
     #   (img_vert_anchors × img_horz_anchors) spatial positions.
     # Each position becomes one token in the diffusion context sequence.

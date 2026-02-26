@@ -24,6 +24,7 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         agent.config.backbone_type="vov" \
         agent.config.vov_ckpt='${oc.env:OPENSCENE_DATA_ROOT}/models/dd3d_det_final.pth' \
         agent.config.freeze_backbone=True \
+        agent.config.noise_type=flow \
         agent.config.num_inference_proposals=100 \
         agent.config.num_diffusion_layers=5 \
         cache_path="${NAVSIM_EXP_ROOT}/training_cache_navmini/" \

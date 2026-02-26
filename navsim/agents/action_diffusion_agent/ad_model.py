@@ -1,18 +1,23 @@
 """
 ActionDiffusionModel — main nn.Module that wires together:
 
-    PerceptionBackbone  →  img_proj  →  image tokens (B, N_img, D)
-    STATUS ENCODER                   →  status token (B,   1,   D)
-    concatenate + positional bias    →  context KV   (B, N_img+1 [+N_img], D)
-    ActionDiffusionHead              →  trajectories / loss
+    BackboneBase subclass   →  img_proj  →  image tokens (B, N_img, D)
+    STATUS ENCODER                        →  status token (B,   1,   D)
+    concatenate + positional bias         →  context KV   (B, N_img+1, D)
+    ActionDiffusionHead                   →  trajectories / loss
 
-The number of image token slots doubles when `use_back_view=True`
-(front stitched + rear stitched cameras each produce N_img tokens).
+The active backbone is selected by `config.backbone_type`:
+  'timm' / 'vov'  —  PoolBackbone (CNN + adaptive pooling)
+  'bev'           —  BEVBackbone  (VoVNet + cross-attention BEV fusion)
+
+The backbone owns all image extraction, so the model is agnostic to
+how many cameras are used or how tokens are produced.
 
 Freezing
 --------
-`freeze_backbone=True` freezes only the PerceptionBackbone encoder.
-All other parameters — including img_proj — are always trainable.
+`freeze_backbone=True` freezes only the backbone encoder.
+All other parameters (img_proj, status_encoder, diffusion_head) are always
+trainable.
 
 Checkpoint loading
 ------------------
@@ -27,7 +32,7 @@ import torch
 import torch.nn as nn
 
 from navsim.agents.action_diffusion_agent.ad_config import ActionDiffusionConfig
-from navsim.agents.action_diffusion_agent.ad_backbone import PerceptionBackbone
+from navsim.agents.action_diffusion_agent.backbones import build_backbone
 from navsim.agents.action_diffusion_agent.ad_diffusion_head import ActionDiffusionHead
 
 
@@ -38,12 +43,11 @@ class ActionDiffusionModel(nn.Module):
         self.config = config
 
         # ── Perception backbone ───────────────────────────────────────────────
-        self.backbone = PerceptionBackbone(config)
+        self.backbone = build_backbone(config)
 
-        # Number of image tokens per forward pass
+        # num_tokens already accounts for back-view doubling (PoolBackbone)
+        # or BEV grid size (BEVBackbone) — no manual adjustment needed here.
         num_img_tokens = self.backbone.num_tokens
-        if config.use_back_view:
-            num_img_tokens *= 2  # front + back panoramic views
 
         # ── Feature projection: backbone channels → model_dim ────────────────
         self.img_proj = nn.Linear(self.backbone.out_channels, config.model_dim)
@@ -114,24 +118,17 @@ class ActionDiffusionModel(nn.Module):
         diffusion head.
 
         Steps:
-          1. Extract the most-recent camera frame and run through the backbone.
+          1. Backbone extracts images from the features dict and returns tokens.
           2. Project backbone tokens to model_dim.
-          3. Optionally repeat for the rear view.
-          4. Encode ego-status as a single token.
-          5. Concatenate image tokens + status token.
-          6. Add learnable positional bias.
+          3. Encode ego-status as a single token.
+          4. Concatenate image tokens + status token.
+          5. Add learnable positional bias.
         """
         cfg = self.config
 
-        # --- Front camera (most recent frame) ---
-        img_front = features["camera_feature"][:, -1]            # (B, 3, H, W)
-        tokens = self.img_proj(self.backbone(img_front))          # (B, N, D)
-
-        # --- Rear camera (optional) ---
-        if cfg.use_back_view:
-            img_back = features["camera_feature_back"][:, -1]    # (B, 3, H, W)
-            back_tokens = self.img_proj(self.backbone(img_back))  # (B, N, D)
-            tokens = torch.cat([tokens, back_tokens], dim=1)      # (B, 2N, D)
+        # The backbone owns all image extraction; it receives the full
+        # features dict and returns (B, num_tokens, out_channels).
+        tokens = self.img_proj(self.backbone(features))           # (B, N, D)
 
         # --- Ego-status token ---
         status = features["status_feature"][:, : cfg.ego_status_dim]  # (B, 8)
