@@ -62,20 +62,18 @@ class ActionDiffusionConfig:
     # -------------------------------------------------------------------
     # BEV backbone settings  (only used when backbone_type='bev')
     # -------------------------------------------------------------------
-    # bev_img_vert_anchors × bev_img_horz_anchors is the VoV spatial pool
-    # size per camera view, i.e. the image tokens fed INTO the fusion
-    # transformer — NOT the output size.  The BEV output is always 8×8 = 64.
     bev_fusion_layers: int = 3        # TransformerEncoder depth
-    bev_img_vert_anchors: int = 8     # VoV pool height per camera (e.g. 8×16 = 128 tokens)
-    bev_img_horz_anchors: int = 16    # VoV pool width  per camera
 
     # -------------------------------------------------------------------
     # Spatial pooling — defines how many image tokens are produced
     # -------------------------------------------------------------------
-    # Used only for backbone_type='timm' and 'vov'.
-    # The backbone's last feature map is pooled to
-    #   (img_vert_anchors × img_horz_anchors) spatial positions.
-    # Each position becomes one token in the diffusion context sequence.
+    # Used by ALL backbone types.  The backbone's last feature map is
+    # pooled to (img_vert_anchors × img_horz_anchors) spatial positions.
+    #   • timm / vov  — these become the output tokens directly.
+    #   • bev         — these are the intermediate image tokens fed INTO
+    #                   the fusion transformer; the BEV output is always
+    #                   8×8 = 64 tokens (controlled by BEVBackbone._BEV_H/W).
+    # Defaults match gtrs_dp.ckpt: pos_emb shape = 2×(16×64)+64 = 2112.
     img_vert_anchors: int = 16
     img_horz_anchors: int = 64
 

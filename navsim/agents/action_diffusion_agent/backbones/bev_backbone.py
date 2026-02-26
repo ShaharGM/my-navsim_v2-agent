@@ -9,7 +9,7 @@ Architecture
 ------------
 For each view (front, back):
     VoV V-99-eSE  →  AdaptiveAvgPool2d  →  (B, P, 1024) image tokens
-    where P = bev_img_vert_anchors × bev_img_horz_anchors  (e.g. 8×16 = 128)
+    where P = img_vert_anchors × img_horz_anchors  (e.g. 16×64 = 1024)
 
 Concatenate front + back image tokens with learnable BEV queries:
     (B, 2P + Q, 1024)   where Q = bev_h × bev_w = 8×8 = 64
@@ -21,7 +21,7 @@ Output: (B, 64, 1024)
 
 Token count note
 ----------------
-bev_img_vert_anchors × bev_img_horz_anchors   —  intermediate image pool size
+img_vert_anchors × img_horz_anchors           —  intermediate image pool size
                                                  (input to fusion transformer)
 8 × 8 = 64                                    —  BEV query output size
                                                  (what this backbone returns)
@@ -85,12 +85,12 @@ class BEVBackbone(BackboneBase):
         self.image_encoder.init_weights()
 
         # ── Spatial pool: VoV feature map → fixed image token grid ────────────
-        # P = bev_img_vert_anchors × bev_img_horz_anchors per camera view.
+        # P = img_vert_anchors × img_horz_anchors per camera view.
         # Attribute name matches HydraBackboneBEV for checkpoint compatibility.
         self.avgpool_img = nn.AdaptiveAvgPool2d(
-            (config.bev_img_vert_anchors, config.bev_img_horz_anchors)
+            (config.img_vert_anchors, config.img_horz_anchors)
         )
-        tokens_per_view = config.bev_img_vert_anchors * config.bev_img_horz_anchors
+        tokens_per_view = config.img_vert_anchors * config.img_horz_anchors
         num_bev_queries = self._BEV_H * self._BEV_W  # 64
 
         # ── Learnable BEV query embeddings ────────────────────────────────────
@@ -179,8 +179,11 @@ class BEVBackbone(BackboneBase):
         raw: dict = ckpt.get("state_dict", ckpt)
 
         prefixes = [
+            "agent.model._backbone.",   # gtrs_dp.ckpt uses _backbone (underscore)
             "agent.model.backbone.",
+            "model._backbone.",
             "model.backbone.",
+            "_backbone.",
             "backbone.",
         ]
         cleaned: dict = {}

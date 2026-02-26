@@ -95,10 +95,8 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 | `bev_ckpt` | `""` | Path to full BEVBackbone checkpoint (`"bev"` only) |
 | `freeze_backbone` | True | Freeze backbone during training |
 | `bev_fusion_layers` | 3 | TransformerEncoder depth inside BEV fusion (`"bev"` only) |
-| `bev_img_vert_anchors` | 8 | VoV pool height per camera fed into BEV fusion (`"bev"` only) |
-| `bev_img_horz_anchors` | 16 | VoV pool width per camera fed into BEV fusion (`"bev"` only) |
-| `img_vert_anchors` | 16 | Spatial pool height — `"timm"` and `"vov"` only |
-| `img_horz_anchors` | 64 | Spatial pool width — `"timm"` and `"vov"` only |
+| `img_vert_anchors` | 16 | Spatial pool height |
+| `img_horz_anchors` | 64 | Spatial pool width  |
 | `model_dim` | 256 | D — transformer/projection dimension |
 | `ffn_dim` | 1024 | Feed-forward inner dim in denoising transformer |
 | `num_heads` | 8 | Attention heads |

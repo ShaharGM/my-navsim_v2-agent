@@ -16,6 +16,12 @@
 #       VoVNet V-99-eSE (same as the GTRS/HydraBackboneBEV pipeline).
 #       Requires a pretrained checkpoint; set vov_ckpt to the .pth path.
 #
+#   backbone_type: 'bev'
+#       VoVNet + cross-attention BEV fusion (matches HydraBackboneBEV from GTRS).
+#       Returns 64 BEV tokens (8×8 grid) at 1024 channels.
+#       Requires vov_ckpt. Optionally set bev_ckpt to load the full backbone state
+#       (image_encoder + fusion transformer + BEV queries) from a GTRS checkpoint.
+#
 # Freeze / unfreeze
 # -----------------
 #   freeze_backbone: true   → only train status encoder + diffusion head  (default)
@@ -63,10 +69,14 @@ config:
   backbone_type: "timm"
   timm_model_name: "resnet50"
   timm_pretrained: true   # load ImageNet-pretrained weights from timm hub
-  vov_ckpt: ""            # only used when backbone_type='vov'
+  vov_ckpt: ""            # path to VoV checkpoint (backbone_type='vov' or 'bev')
+  bev_ckpt: ""            # path to full BEVBackbone checkpoint (backbone_type='bev' only)
   freeze_backbone: true   # freeze backbone + projection; train only the head
 
-  # ── Spatial pooling ────────────────────────────────────────────────────────
+  # ── BEV backbone settings (only used when backbone_type='bev') ─────────────
+  bev_fusion_layers: 3
+
+  # ── Spatial pooling (only used when backbone_type='timm' or 'vov') ─────────
   # num_image_tokens = img_vert_anchors × img_horz_anchors
   # (× 2 when use_back_view=true)
   img_vert_anchors: 16
