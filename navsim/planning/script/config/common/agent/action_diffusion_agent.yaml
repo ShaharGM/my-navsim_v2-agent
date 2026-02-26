@@ -76,9 +76,12 @@ config:
   # ── BEV backbone settings (only used when backbone_type='bev') ─────────────
   bev_fusion_layers: 3
 
-  # ── Spatial pooling (only used when backbone_type='timm' or 'vov') ─────────
-  # num_image_tokens = img_vert_anchors × img_horz_anchors
-  # (× 2 when use_back_view=true)
+  # ── Spatial pooling (ALL backbone types) ──────────────────────────────────
+  # Each camera's feature map is pooled to (img_vert_anchors × img_horz_anchors).
+  #   timm / vov → these become the output tokens directly
+  #   bev        → intermediate tokens fed into the BEV fusion transformer
+  #                 (BEV output is always 8×8 = 64 tokens, fixed by BEVBackbone)
+  # Defaults match gtrs_dp.ckpt: pos_emb shape = 2×(16×64)+64 = 2112.
   img_vert_anchors: 16
   img_horz_anchors: 64
 

@@ -95,8 +95,8 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 | `bev_ckpt` | `""` | Path to full BEVBackbone checkpoint (`"bev"` only) |
 | `freeze_backbone` | True | Freeze backbone during training |
 | `bev_fusion_layers` | 3 | TransformerEncoder depth inside BEV fusion (`"bev"` only) |
-| `img_vert_anchors` | 16 | Spatial pool height |
-| `img_horz_anchors` | 64 | Spatial pool width  |
+| `img_vert_anchors` | 16 | VoV/CNN pool height per camera — **all** backbone types; defaults match `gtrs_dp.ckpt` |
+| `img_horz_anchors` | 64 | VoV/CNN pool width per camera — **all** backbone types |
 | `model_dim` | 256 | D — transformer/projection dimension |
 | `ffn_dim` | 1024 | Feed-forward inner dim in denoising transformer |
 | `num_heads` | 8 | Attention heads |
@@ -183,13 +183,13 @@ Output:     (B, 64, 1024)   — 64 BEV query tokens (8×8 grid), 1024 channels
 ```
 
 Internal pipeline:
-1. VoV encoder → `AdaptiveAvgPool2d((bev_img_vert_anchors, bev_img_horz_anchors))` → `(B, P, 1024)` per camera, where `P = bev_img_vert_anchors × bev_img_horz_anchors`.
+1. VoV encoder → `AdaptiveAvgPool2d((img_vert_anchors, img_horz_anchors))` → `(B, P, 1024)` per camera, where `P = img_vert_anchors × img_horz_anchors`.
 2. Concat front + back → `(B, 2P, 1024)`.
 3. Concat with learnable BEV queries `(B, 64, 1024)` → `(B, 2P+64, 1024)`.
 4. Add positional embeddings, run `TransformerEncoder` (`bev_fusion_layers` layers, 16 heads).
 5. Return only the last 64 positions (BEV query outputs): `tokens[:, 2P:]`.
 
-Checkpoint loading (`bev_ckpt`): strips `"agent.model.backbone."` / `"model.backbone."` / `"backbone."` prefixes.
+Checkpoint loading (`bev_ckpt`): strips `"agent.model._backbone."` / `"agent.model.backbone."` / `"model.backbone."` / `"backbone."` prefixes automatically.
 
 ---
 
