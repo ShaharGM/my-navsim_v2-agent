@@ -27,6 +27,8 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         agent.config.bev_ckpt='${oc.env:NAVSIM_DEVKIT_ROOT}/weights/gtrs_dp.ckpt' \
         agent.config.noise_type="flow" \
         agent.config.num_flow_steps=10 \
+        agent.config.use_diffusion_forcing=True \
+        agent.config.uncertainty_scale=1.0 \
         agent.config.num_inference_proposals=100 \
         agent.config.num_diffusion_layers=5 \
         cache_path="${NAVSIM_EXP_ROOT}/training_cache_navmini/" \

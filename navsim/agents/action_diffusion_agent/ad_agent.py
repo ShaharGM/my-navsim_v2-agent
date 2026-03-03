@@ -171,7 +171,8 @@ class ActionDiffusionAgent(AbstractAgent):
         predictions: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """
-        DDPM epsilon-prediction MSE loss.
+        Diffusion denoising loss — dispatches to DDPM epsilon-prediction MSE
+        or flow-matching velocity-prediction MSE based on ``config.noise_type``.
 
         The scene context KV (`predictions['context_kv']`) is produced by the
         model forward pass; the dense 40-step ground-truth trajectory is taken

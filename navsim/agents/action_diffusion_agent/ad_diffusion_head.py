@@ -743,55 +743,74 @@ class ActionDiffusionHead(nn.Module):
         Flow-matching inference via Euler integration, unified for standard and
         Diffusion Forcing modes.
 
-        Standard mode (``use_diffusion_forcing=False``):
-            All waypoints share the same t value (t_start=1 for all), integrating
-            from t=1 → 0 in ``num_flow_steps`` uniform steps.  The denoiser
-            receives a scalar (B*N,) timestep, identical to the original Euler loop.
+        Both modes use the same pyramid scheduling matrix as the DDPM path
+        (via ``_build_pyramid_schedule``), with integer levels divided by
+        ``n_steps`` to map them into the continuous t ∈ [0, 1] range.
 
-        Diffusion Forcing mode (``use_diffusion_forcing=True``):
-            Token i starts at  t_start[i] = clip(1 + i*offset*dt, 0, 1),  so
-            near-future waypoints reach t=0 before far-future ones.  The denoiser
-            receives a per-token (B*N, T_way) timestep.
+        Standard mode (``use_diffusion_forcing=False``, offset=0):
+            Flat schedule — all tokens advance together from t=1 to t=0 in
+            ``n_steps`` uniform Euler steps.  Equivalent to the original loop.
+            The denoiser receives a scalar (B*N,) timestep.
 
-        Both modes share identical loop logic; only ``t_start`` and the shape of
-        the denoiser input differ.
+            Example with n_steps=5, 4 tokens:
+              m=0: t=[1.0, 1.0, 1.0, 1.0]
+              m=1: t=[0.8, 0.8, 0.8, 0.8]
+              ...
+              m=5: t=[0.0, 0.0, 0.0, 0.0]
+
+        Diffusion Forcing mode (``use_diffusion_forcing=True``, offset>=1):
+            Pyramid schedule — token i lags token 0 by i*offset Euler steps.
+            Near-future waypoints are fully denoised before far-future ones
+            begin integrating.  t stays in [0, 1] at every step.
+            The denoiser receives a per-token (B*N, T_way) timestep.
+
+            Example with n_steps=5, 4 tokens, offset=1:
+              m=0: t=[1.0, 1.0, 1.0, 1.0]
+              m=1: t=[0.8, 1.0, 1.0, 1.0]
+              m=2: t=[0.6, 0.8, 1.0, 1.0]
+              m=3: t=[0.4, 0.6, 0.8, 1.0]
+              m=4: t=[0.2, 0.4, 0.6, 0.8]
+              m=5: t=[0.0, 0.2, 0.4, 0.6]
+              m=6: t=[0.0, 0.0, 0.2, 0.4]
+              m=7: t=[0.0, 0.0, 0.0, 0.2]
+              m=8: t=[0.0, 0.0, 0.0, 0.0]
         """
         cfg = self.config
         ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype = self._prepare_inference(context, features)
 
         T_way   = cfg.internal_horizon
         n_steps = cfg.num_flow_steps
-        dt      = 1.0 / n_steps
-        i_arr   = torch.arange(T_way, device=device, dtype=dtype)
 
-        # Per-token integration start time.
-        # Standard (offset=0): t_start = 1 for all.
-        # DF (offset>=1):      t_start[i] = clip(1 + i*offset*dt, 0, 1).
-        if cfg.use_diffusion_forcing:
-            offset  = max(1, int(round(cfg.uncertainty_scale)))
-            t_start = (1.0 + i_arr * offset * dt).clamp(0.0, 1.0)          # (T_way,)
-        else:
-            t_start = torch.ones(T_way, device=device, dtype=dtype)         # (T_way,)
-
-        total_outer = int(t_start.max().item() / dt) + 1
+        # Build the scheduling matrix in integer "step-level" space [0, n_steps],
+        # then convert to continuous t ∈ [0, 1] by dividing by n_steps.
+        # offset=0 → flat (standard); offset>=1 → pyramid (DF).
+        offset = max(1, int(round(cfg.uncertainty_scale))) if cfg.use_diffusion_forcing else 0
+        sched  = self._build_pyramid_schedule(n_steps, T_way, offset)
 
         # Start from pure Gaussian noise.
         x = torch.randn(B * N, T_way, cfg.action_dim, dtype=dtype, device=device)
 
-        for m in range(total_outer):
-            t_curr = (t_start - m * dt).clamp(0.0, 1.0)          # (T_way,)
-            t_next = (t_start - (m + 1) * dt).clamp(0.0, 1.0)
+        for m in range(len(sched) - 1):
+            from_lev = torch.tensor(sched[m],     dtype=dtype, device=device)  # (T_way,)
+            to_lev   = torch.tensor(sched[m + 1], dtype=dtype, device=device)
 
-            update_mask = t_curr > t_next
+            t_curr = from_lev / n_steps                           # (T_way,) ∈ [0, 1]
+            t_next = to_lev   / n_steps
+
+            update_mask = t_curr > t_next                         # tokens active this step
             if not update_mask.any():
-                break
+                continue
 
-            # Standard mode: all entries identical → collapse to scalar (B*N,) so the
-            # denoiser uses its 1-time-token path (cond_pos sized accordingly).
-            t_in = t_curr[None].expand(B * N, -1) if cfg.use_diffusion_forcing else t_curr[0].expand(B * N)
+            # Standard mode: all active tokens share the same t → scalar (B*N,)
+            # DF mode: per-token t → (B*N, T_way)
+            t_in = t_curr[0].expand(B * N) if not cfg.use_diffusion_forcing else t_curr[None].expand(B * N, -1)
 
             v    = self.denoiser(x, t_in, ctx)                    # (B*N, T_way, A)
-            mask = update_mask[None, :, None].expand(B * N, -1, cfg.action_dim)
-            x    = x - torch.where(mask, dt * v, torch.zeros_like(v))
+
+            # Per-token Euler step: dt_i = t_curr[i] - t_next[i] (= 1/n_steps for
+            # active tokens, 0 for inactive ones — so no explicit masking needed,
+            # but we keep update_mask.any() above to skip the denoiser call).
+            step = (t_curr - t_next)[None, :, None]               # (1, T_way, 1)
+            x    = x - step * v
 
         return self._actions_to_output(x, hist_xyz, hist_rot, t0_states, B, N)
