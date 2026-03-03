@@ -801,9 +801,14 @@ class ActionDiffusionHead(nn.Module):
             if not update_mask.any():
                 continue
 
-            # Standard mode: all active tokens share the same t → scalar (B*N,)
-            # DF mode: per-token t → (B*N, T_way)
-            t_in = t_curr[0].expand(B * N) if not cfg.use_diffusion_forcing else t_curr[None].expand(B * N, -1)
+            # Standard mode: all active tokens share the same t value → pass a
+            # (B*N,) 1-D scalar timestep, identical to what training sends (B,).
+            # The broadcast to T waypoints happens inside _PerWaypointEncoder.
+            # DF mode: per-token (B*N, T_way) timestep — no broadcast needed.
+            if cfg.use_diffusion_forcing:
+                t_in = t_curr[None].expand(B * N, -1)           # (B*N, T_way)
+            else:
+                t_in = t_curr[0].item() * torch.ones(B * N, device=device, dtype=dtype)  # (B*N,)
 
             v    = self.denoiser(x, t_in, ctx)                    # (B*N, T_way, A)
 
