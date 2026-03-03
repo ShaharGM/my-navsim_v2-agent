@@ -112,6 +112,8 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 | `pretrained_ckpt` | `""` | Checkpoint to load backbone+proj from (skips head) |
 | `noise_type` | `"ddpm"` | `"ddpm"` for DDPM or `"flow"` for flow matching |
 | `num_flow_steps` | 20 | Euler integration steps at inference time (flow only) |
+| `use_diffusion_forcing` | False | Independent per-token noise levels at training + pyramid scheduling at inference (see §7.3) |
+| `uncertainty_scale` | 1.0 | Stagger between adjacent waypoints in the pyramid schedule (DDPM timesteps or Euler steps) |
 | `weight_decay` | 0.0 | Adam weight decay |
 | `dp_loss_weight` | 10.0 | Multiplier on the MSE diffusion loss |
 
@@ -212,13 +214,19 @@ The denoising transformer architecture is **shared and unchanged** between both 
 | `_DenoisingTransformer` | Pre-LN TransformerDecoder; action queries cross-attend context KV |
 
 #### `_DenoisingTransformer`
-- Input:  `noise_or_xt (B,T,A)`, `timestep (B,)`, `context (B,L,D)`
-- `timestep` is an **integer** (DDPM) or a **continuous float in [0,1]** (flow matching)
-- `noise_type` is passed at construction to select the time embedding module:
+- Input: `noise_or_xt (B,T,A)`, `timestep (B,) or (B,T)`, `context (B,L,D)`
+  - Scalar `(B,)`: standard mode — integer (DDPM) or continuous float in [0,1] (flow)
+  - Per-token `(B,T)`: Diffusion Forcing mode — one independent noise level per waypoint
+- `noise_type` passed at construction selects the time embedding module:
   - DDPM → `_SinusoidalPosEmb(d_model)`
   - Flow → `_FourierEncoder(dim=d_model)`
-- Time token prepended to the context KV: `(B, L+1, D)`
-- Learned positional biases: `action_pos (1,T,D)` on query side, `cond_pos (1,L+1,D)` on KV side
+- KV time token(s) prepended to context:
+  - Standard `(B,)`: 1 global token → memory is `(B, L+1, D)`
+  - Diffusion Forcing `(B,T)`: T per-waypoint tokens → memory is `(B, L+T, D)`
+- Learned positional biases: `action_pos (1,T,D)` on query side; `cond_pos` on KV side
+  - Standard: `(1, context_len+1, D)`
+  - Diffusion Forcing: `(1, context_len+T, D)`
+  - The two sizes are exclusive — `use_diffusion_forcing` is passed to `__init__` to select the exact allocation; no wasted parameters either way
 - Architecture: Pre-LN multi-head cross-attention → Pre-LN FFN (GeLU), N layers
 - Output: predicted noise ε (DDPM) or predicted velocity v (flow): `(B, T, A)`
 
@@ -231,11 +239,17 @@ Dispatches to `_ddpm_compute_loss` or `_flow_compute_loss` based on `config.nois
 **DDPM (`_ddpm_compute_loss`)**:
 ```python
 # 1. GT actions via _get_gt_actions() → (B, 40, 2)
-# 2. DDPM forward process: add noise at a random integer timestep
 noise = torch.randn_like(gt_actions)
-timesteps = randint(0, T, (B,))  # integer
-noisy_actions = noise_scheduler.add_noise(gt_actions, noise, timesteps)
-# 3. Predict noise; MSE loss
+if use_diffusion_forcing:
+    # Independent per-token timestep: (B, T)
+    timesteps = randint(0, T, (B, T))
+    sqrt_a    = alphas_cumprod[timesteps].sqrt()[..., None]      # (B,T,1)
+    sqrt_1ma  = (1 - alphas_cumprod[timesteps]).sqrt()[..., None]
+    noisy_actions = sqrt_a * gt_actions + sqrt_1ma * noise
+else:
+    # Shared timestep: (B,)
+    timesteps = randint(0, T, (B,))
+    noisy_actions = noise_scheduler.add_noise(gt_actions, noise, timesteps)
 pred_noise = denoiser(noisy_actions, timesteps, context)
 return F.mse_loss(pred_noise, noise)
 ```
@@ -243,47 +257,87 @@ return F.mse_loss(pred_noise, noise)
 **Flow matching (`_flow_compute_loss`)**:
 ```python
 # 1. GT actions via _get_gt_actions() → x0 (B, 40, 2)
-# 2. Sample continuous time t ~ Uniform[0, 1], one per sample
-t = torch.rand(B, device=device)          # float in [0, 1]
-# 3. Linear interpolation: x_t = (1-t)*x0 + t*noise
 noise = torch.randn_like(x0)
-x_t = (1 - t[:,None,None]) * x0 + t[:,None,None] * noise
-# 4. Ground-truth velocity
+if use_diffusion_forcing:
+    t = torch.rand(B, T)        # (B, T) — per-token
+    t_bcast = t[..., None]      # (B, T, 1)
+else:
+    t = torch.rand(B)           # (B,)   — shared
+    t_bcast = t[:, None, None]  # (B, 1, 1)
+x_t = (1 - t_bcast) * x0 + t_bcast * noise
 target_v = noise - x0
-# 5. Predict velocity; MSE loss
-pred_v = denoiser(x_t, t, context)        # t is (B,) float
+pred_v = denoiser(x_t, t, context)
 return F.mse_loss(pred_v, target_v)
 ```
 
 #### `forward()` — inference dispatcher
 Dispatches to `_ddpm_forward` or `_flow_forward` based on `config.noise_type`.
 
-**DDPM (`_ddpm_forward`)**:
+#### Private inference helpers
+
+**`_prepare_inference(context, features)`** — shared boilerplate called by both forward methods:
 ```python
-# 1. Start from pure Gaussian noise (B*N proposals)
-noise = randn(B*N, 40, 2)
-# 2. Full DDPM reverse chain
-scheduler.set_timesteps(T, device)
-for t in scheduler.timesteps:
-    pred_eps = denoiser(noise, t.expand(B*N), ctx)
-    noise = scheduler.step(pred_eps, t, noise).prev_sample
-# 3. action_to_traj → dense trajectory → sparse trajectory
-return {"dp_pred": (B,N,8,3), "pred_actions": (B,N,40,2)}
+# Expands context for N proposals and constructs unicycle inputs.
+ctx       = context.repeat_interleave(N, dim=0)   # (B*N, L, D)
+hist_xyz, hist_rot = _build_history(features)      # repeated for B*N
+v0 = features["status_feature"][:, 4].repeat_interleave(N)
+t0_states = {"v": v0}
+return ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype
 ```
 
-**Flow matching (`_flow_forward`)**:
+**`_actions_to_output(pred_actions_norm, ...)`** — shared post-processing:
 ```python
-# 1. Start from pure Gaussian noise at t=1 (B*N proposals)
-x = randn(B*N, 40, 2)
-# 2. Euler integration from t=1 → t=0 (num_flow_steps uniform steps)
-n_steps = cfg.num_flow_steps;  dt = 1.0 / n_steps
-for i in range(n_steps, 0, -1):
-    t_val = i / n_steps                         # float in (0, 1]
-    t_b = torch.full((B*N,), t_val, ...)
-    v = denoiser(x, t_b, ctx)                   # predicted velocity
-    x = x - dt * v                               # Euler step toward t=0
-# 3. action_to_traj → dense trajectory → sparse trajectory
-return {"dp_pred": (B,N,8,3), "pred_actions": (B,N,40,2)}
+# Denormalise → unicycle forward → sparse trajectory → output dict
+pred_actions_denorm = _denormalize_actions(pred_actions_norm)
+traj_xyz, traj_rot  = action_space.action_to_traj(pred_actions_norm, ...)
+traj_sparse = cat([traj_xyz[...,:2], heading], -1)[:, 4::5, :]
+return {"dp_pred": traj_sparse.view(B,N,8,3), "pred_actions": pred_actions_denorm.view(B,N,40,2)}
+```
+
+**`_build_pyramid_schedule(num_base_steps, num_tokens, offset)`** — static, pure Python:
+```
+level[m][i] = clip(num_base_steps + i*offset − m,  0,  num_base_steps)
+```
+- `offset=0`: flat schedule — all tokens at the same level per row (standard sampling)
+- `offset≥1`: pyramid schedule — token `i` lags token `0` by `i*offset` steps (Diffusion Forcing)
+
+**DDPM (`_ddpm_forward`)** — unified for standard and Diffusion Forcing:
+```python
+# offset=0 (standard) or int(uncertainty_scale) (DF)
+offset = int(uncertainty_scale) if use_diffusion_forcing else 0
+sched  = _build_pyramid_schedule(T_diff, T_way, offset)   # list-of-lists
+acp      = noise_scheduler.alphas_cumprod
+acp_prev = cat([ones(1), acp[:-1]])
+x = randn(B*N, T_way, A)
+for m in range(len(sched) - 1):
+    from_lev, to_lev = sched[m], sched[m+1]              # (T_way,) ints
+    update_mask = from_lev > to_lev                       # tokens that step
+    t_idx = (from_lev - 1).clamp(0)                      # DDPM timestep index
+    # Standard: pass scalar t (B*N,) — denoiser uses 1 time token in KV
+    # DF:       pass per-token t (B*N, T_way) — denoiser uses T time tokens in KV
+    t_in = t_idx_bn[:, 0] if not use_diffusion_forcing else t_idx_bn
+    pred_eps = denoiser(x, t_in, ctx)
+    # Per-token DDPM posterior q(x_{t-1} | x_t, x̂_0)
+    x0    = (x - sqrt(1-acp[t_idx])*pred_eps) / sqrt(acp[t_idx])
+    x_new = ddpm_posterior_sample(x0, x, t_idx)           # mean + variance
+    x = where(update_mask, x_new, x)
+return _actions_to_output(x, ...)
+```
+
+**Flow matching (`_flow_forward`)** — unified for standard and Diffusion Forcing:
+```python
+# Standard:  t_start = ones(T_way)              — all tokens integrate from t=1
+# DF:        t_start[i] = 1 + i*offset*dt       — staggered start times
+t_start = ones(T_way) if not use_diffusion_forcing else (1 + i_arr*offset*dt).clamp(0,1)
+for m in range(total_outer):
+    t_curr  = (t_start - m*dt).clamp(0, 1)
+    t_next  = (t_start - (m+1)*dt).clamp(0, 1)
+    update_mask = t_curr > t_next
+    # Standard: collapse to scalar (B*N,); DF: per-token (B*N, T_way)
+    t_in = t_curr[0].expand(B*N) if not use_diffusion_forcing else t_curr[None].expand(B*N,-1)
+    v = denoiser(x, t_in, ctx)
+    x = x - where(update_mask, dt*v, zeros_like(v))
+return _actions_to_output(x, ...)
 ```
 
 #### History construction (`_build_history`)
@@ -524,12 +578,14 @@ context KV:           (B, 2049, D)            = 2048 + 1  (or 65 for BEV backbon
 # Diffusion (DDPM)
 noisy_actions:        (B, 40, 2)              (accel, curvature), z-score normed
 pred_noise:           (B, 40, 2)
-t_batch:              (B,)                    integer timestep 0…T-1
+t_batch:              (B,)                    integer timestep 0…T-1   [standard]
+                      (B, T)                  per-token timestep        [use_diffusion_forcing]
 
 # Diffusion (flow matching)
 x_t:                  (B, 40, 2)              linearly interpolated actions
 pred_velocity:        (B, 40, 2)              predicted velocity v = ε - x0
-t_batch:              (B,)                    continuous float in [0, 1]
+t_batch:              (B,)                    continuous float in [0, 1]  [standard]
+                      (B, T)                  per-token float in [0, 1]   [use_diffusion_forcing]
 
 # Output
 dp_pred:              (B, N, 8, 3)            [x, y, heading] ego-relative
@@ -585,7 +641,64 @@ DDPM and flow matching checkpoints are **not interchangeable** — the denoiser 
 
 ---
 
-### 7.3 Future: DDIM (easy upgrade from DDPM, ~15 min)
+### 7.3 Diffusion Forcing (`use_diffusion_forcing=True`)
+
+Based on **Chen et al., 2024** (arXiv:2407.01392).
+
+The core idea: during **training**, instead of drawing a **single** timestep `t` per batch item and applying the same noise level to all 40 waypoints, draw an **independent** noise level `t_i` for each waypoint `i`. This trains the model to denoise sequences with arbitrary, heterogeneous noise levels. At **inference**, this flexibility is exploited via a **pyramid scheduling matrix**: near-future waypoints are denoised first, far-future waypoints lag behind by `uncertainty_scale` steps each — expressing a natural causal uncertainty about the future.
+
+| Aspect | Standard | Diffusion Forcing |
+|---|---|---|
+| Timestep tensor shape | `(B,)` | `(B, T)` — one per waypoint |
+| Noise application | same `t` broadcast to all 40 tokens | per-token independent noise |
+| Per-token time embedding | `_PerWaypointEncoder` broadcasts `(B,F)→(B,T,F)` | encodes `(B,T)` directly → `(B,T,F)` |
+| KV time tokens | 1 global token `(B, 1, D)` prepended to KV | T per-waypoint tokens `(B, T, D)` prepended to KV |
+| `cond_pos` size | `(1, context_len+1, D)` | `(1, context_len+T, D)` |
+| Inference | flat schedule (offset=0): all tokens step together | pyramid schedule (offset≥1): token `i` lags by `i × uncertainty_scale` steps |
+| Compatible with | — | both `noise_type='ddpm'` and `noise_type='flow'` |
+
+**Config fields:**
+```yaml
+use_diffusion_forcing: true   # enables DF training + pyramid inference
+uncertainty_scale: 1.0        # stagger between adjacent waypoints (int DDPM steps or Euler steps)
+```
+
+#### The scheduling matrix
+
+Both standard and DF inference use a unified `_build_pyramid_schedule(T, num_tokens, offset)` which produces a `(total_steps, num_tokens)` matrix:
+```
+level[m][i] = clip(T + i*offset − m,  0,  T)
+```
+- **offset=0** (standard): flat schedule — all tokens at the same noise level, all step together. Equivalent to the plain DDPM reverse chain or Euler loop.
+- **offset≥1** (DF): token `i` starts `i*offset` steps later, so near-future waypoints finish first.
+
+This unification means `_ddpm_forward` and `_flow_forward` each contain **one loop** that handles both modes — there are no separate `_ddpm_forward_df` / `_flow_forward_df` functions.
+
+#### Training pseudocode
+
+**DDPM + DF** (`_ddpm_compute_loss`):
+```python
+timesteps = torch.randint(0, T_max, (B, T))                       # (B, T)
+sqrt_a    = alphas_cumprod[timesteps].sqrt()[..., None]           # (B, T, 1)
+sqrt_1ma  = (1 - alphas_cumprod[timesteps]).sqrt()[..., None]
+noisy_actions = sqrt_a * x0 + sqrt_1ma * noise
+pred_noise = denoiser(noisy_actions, timesteps, context)          # (B*N, T, A)
+return F.mse_loss(pred_noise, noise)
+```
+
+**Flow + DF** (`_flow_compute_loss`):
+```python
+t = torch.rand(B, T)           # (B, T) ∈ [0, 1] per waypoint
+t_bcast = t[..., None]         # (B, T, 1)
+x_t = (1-t_bcast)*x0 + t_bcast*noise
+target_v = noise - x0
+pred_v = denoiser(x_t, t, context)
+return F.mse_loss(pred_v, target_v)
+```
+
+---
+
+### 7.5 Future: DDIM (easy upgrade from DDPM, ~15 min)
 
 DDIM shares the **exact same training objective** as DDPM (epsilon-prediction MSE).  
 Only inference changes — a non-Markovian shortcut path that allows ~10× fewer steps.
@@ -618,7 +731,10 @@ Net effect: training unchanged, inference 10× faster, slight reduction in traje
 
 5. **`trajectory` is a zero placeholder during training.** NAVSIM's `AgentLightningModule` calls `forward()` then `compute_loss()`. The trajectory output is only used by the evaluator, never by the training loop. Returning zeros avoids wasting inference compute during training.
 
-6. **`context_len + 1` in the denoiser.** `_DenoisingTransformer.cond_pos` is sized `(1, context_len+1, D)` because the sinusoidal time token is **prepended** to the context KV at every forward pass, making the effective sequence length `L+1`.
+6. **`cond_pos` sizing in the denoiser.** `_DenoisingTransformer.cond_pos` is sized exactly to account for the time token(s) prepended to context KV:
+   - Standard mode (`use_diffusion_forcing=False`): 1 global time token → `(1, context_len+1, D)`
+   - Diffusion Forcing (`use_diffusion_forcing=True`): T per-waypoint time tokens → `(1, context_len+T, D)`
+   The flag is passed to `__init__` so the allocation is exact — no wasted parameters in either mode. A checkpoint trained in one mode cannot be loaded into a model configured for the other.
 
 7. **Two checkpoint concepts:**
    - `config.pretrained_ckpt` → backbone warm-start only (strips diffusion_head keys)

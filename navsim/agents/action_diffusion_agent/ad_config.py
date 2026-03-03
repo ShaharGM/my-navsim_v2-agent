@@ -141,6 +141,22 @@ class ActionDiffusionConfig:
     num_flow_steps: int = 20
 
     # -------------------------------------------------------------------
+    # Diffusion Forcing  (Chen et al., 2024 — arXiv 2407.01392)
+    # -------------------------------------------------------------------
+    # When True, each waypoint in the sequence receives an *independent*
+    # noise level during training instead of the same level for all tokens.
+    # The timestep tensor becomes (B, T) rather than (B,).
+    # Inference is unchanged — standard same-t rollout works because the
+    # model learns to denoise under any combination of per-token noise levels.
+    # Compatible with both noise_type='ddpm' and noise_type='flow'.
+    use_diffusion_forcing: bool = False
+    # Controls the noise-level stagger between adjacent waypoints at inference
+    # time (Diffusion Forcing pyramid schedule).  Expressed in base denoising
+    # steps: a value of 1 means waypoint i+1 starts denoising exactly 1 step
+    # later than waypoint i.  Has no effect when use_diffusion_forcing=False.
+    uncertainty_scale: float = 1.0
+
+    # -------------------------------------------------------------------
     # Training hyper-parameters
     # -------------------------------------------------------------------
     weight_decay: float = 0.0

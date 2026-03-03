@@ -120,6 +120,14 @@ config:
   # Set to "" to start from scratch / timm ImageNet weights.
   pretrained_ckpt: ""
 
+  # ── Diffusion Forcing ──────────────────────────────────────────────────────
+  # use_diffusion_forcing: true  → per-token independent noise levels at training,
+  #                                pyramid scheduling matrix at inference.
+  # uncertainty_scale: stagger between adjacent waypoints (in DDPM timesteps or
+  #                    Euler steps for flow); higher = more causal left-to-right.
+  use_diffusion_forcing: false
+  uncertainty_scale: 1.0
+
   # ── Training ───────────────────────────────────────────────────────────────
   weight_decay: 0.0
   dp_loss_weight: 10.0

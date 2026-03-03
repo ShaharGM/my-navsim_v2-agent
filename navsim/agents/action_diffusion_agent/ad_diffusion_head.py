@@ -101,12 +101,12 @@ class _SinusoidalPosEmb(nn.Module):
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: (B,) integer timesteps
+        # t: (...) integer timesteps — supports (B,) and (B, T)
         half = self.dim // 2
         freqs = math.log(10000) / (half - 1)
         freqs = torch.exp(torch.arange(half, device=t.device) * -freqs)  # (half,)
-        emb = t[:, None].float() * freqs[None, :]                        # (B, half)
-        return torch.cat([emb.sin(), emb.cos()], dim=-1)                  # (B, dim)
+        emb = t[..., None].float() * freqs                               # (..., half)
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)                  # (..., dim)
 
 
 def _build_mlp(in_dim: int, hidden: int, out_dim: int, depth: int = 4) -> nn.Sequential:
@@ -156,8 +156,10 @@ class _PerWaypointEncoder(nn.Module):
     def forward(self, actions: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            actions:  (B, T, A) — noisy action sequence (normalised)
-            timestep: (B,)      — int timestep (DDPM: 0…T-1) or float t (flow: 0…1)
+            actions:  (B, T, A)      — noisy action sequence (normalised)
+            timestep: (B,) or (B, T) — int timestep (DDPM) or float t (flow).
+                      (B, T) is used when use_diffusion_forcing=True; each
+                      waypoint gets its own independent noise level.
 
         Returns:
             (B, T, d_model)
@@ -169,8 +171,13 @@ class _PerWaypointEncoder(nn.Module):
             dim=-1,
         )  # (B, T, A*F)
 
-        # Timestep Fourier features broadcast over the waypoint axis
-        t_feat = self.time_encoder(timestep.float())[:, None, :].expand(-1, T, -1)  # (B, T, F)
+        # Timestep Fourier features: (B,) → broadcast to all T positions,
+        # or (B, T) → per-token encoding (Diffusion Forcing).
+        t_enc = self.time_encoder(timestep.float())   # (B, F) or (B, T, F)
+        if t_enc.dim() == 2:                          # standard: same t for all tokens
+            t_feat = t_enc[:, None, :].expand(-1, T, -1)   # → (B, T, F)
+        else:                                         # diffusion forcing: per-token t
+            t_feat = t_enc                                  # already (B, T, F)
 
         combined = torch.cat([act_feats, t_feat], dim=-1)  # (B, T, (A+1)*F)
         return self.norm(self.proj(combined))               # (B, T, d_model)
@@ -195,11 +202,12 @@ class _DenoisingTransformer(nn.Module):
         nhead: int,
         ffn_dim: int,
         num_layers: int,
-        d_cond: int,           # dimension of the incoming KV context tensor
-        context_len: int,      # number of context tokens (image + status tokens)
+        d_cond: int,                      # dimension of the incoming KV context tensor
+        context_len: int,                 # number of context tokens (image + status tokens)
         action_dim: int,
         horizon: int,
-        noise_type: str = "ddpm",  # 'ddpm' or 'flow'
+        noise_type: str = "ddpm",         # 'ddpm' or 'flow'
+        use_diffusion_forcing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -218,7 +226,10 @@ class _DenoisingTransformer(nn.Module):
 
         # Learnable positional biases
         self.action_pos = nn.Parameter(torch.zeros(1, horizon, d_model))
-        self.cond_pos = nn.Parameter(torch.zeros(1, context_len + 1, d_model))  # +1 for time token
+        # Standard mode:         1 time token  → cond_pos shape (1, context_len + 1,       d_model)
+        # Diffusion Forcing mode: T time tokens → cond_pos shape (1, context_len + horizon, d_model)
+        _n_time_slots = horizon if use_diffusion_forcing else 1
+        self.cond_pos = nn.Parameter(torch.zeros(1, context_len + _n_time_slots, d_model))
 
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
@@ -257,9 +268,11 @@ class _DenoisingTransformer(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            noisy_actions: (B, T, A)   — noisy (or interpolated) action sequence
-            timestep:      (B,)         — int timestep (DDPM) or float t ∈ [0,1] (flow)
-            context:       (B, L, d_cond) — scene KV (image + status tokens)
+            noisy_actions: (B, T, A)         — noisy (or interpolated) action sequence
+            timestep:      (B,) or (B, T)     — int timestep (DDPM) or float t ∈ [0,1] (flow).
+                           When use_diffusion_forcing=True, shape is (B, T): one noise
+                           level per waypoint.  T time tokens are added to the KV.
+            context:       (B, L, d_cond)    — scene KV (image + status tokens)
 
         Returns:
             predicted_noise / predicted_velocity: (B, T, A)
@@ -268,10 +281,14 @@ class _DenoisingTransformer(nn.Module):
         act_emb = self.action_encoder(noisy_actions, timestep)   # (B, T, d_model)
         act_emb = act_emb + self.action_pos                       # add positional bias
 
-        # --- Memory: time token + projected context ---
-        t_emb = self.time_emb(timestep).unsqueeze(1)             # (B, 1, d_model)
+        # --- Memory: time token(s) + projected context ---
+        # Standard mode    (timestep: (B,))    → 1 global time token   → (B, 1,   d_model)
+        # Diffusion Forcing (timestep: (B, T)) → T per-token time tokens → (B, T, d_model)
+        # Both are handled identically downstream; cond_pos is pre-sized for the max.
+        t_emb_raw = self.time_emb(timestep)                      # (B, d_model) or (B, T, d_model)
+        t_emb = t_emb_raw.unsqueeze(1) if t_emb_raw.dim() == 2 else t_emb_raw  # (B, 1|T, d_model)
         ctx_emb = self.cond_proj(context)                        # (B, L, d_model)
-        memory = torch.cat([t_emb, ctx_emb], dim=1)             # (B, L+1, d_model)
+        memory = torch.cat([t_emb, ctx_emb], dim=1)             # (B, L+1 or L+T, d_model)
         memory = memory + self.cond_pos[:, : memory.size(1), :]  # positional bias
 
         # --- Cross-attend ---
@@ -352,6 +369,7 @@ class ActionDiffusionHead(nn.Module):
             action_dim=config.action_dim,
             horizon=config.internal_horizon,
             noise_type=config.noise_type,
+            use_diffusion_forcing=config.use_diffusion_forcing,
         )
 
     # ─────────────────────────────────────────────────────── helpers ──────────
@@ -484,13 +502,27 @@ class ActionDiffusionHead(nn.Module):
 
         # DDPM forward process: add noise at a random timestep
         noise = torch.randn_like(gt_actions_norm)
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (B,),
-            device=device,
-        ).long()
-        noisy_actions = self.noise_scheduler.add_noise(gt_actions_norm, noise, timesteps)
+        T = gt_actions_norm.shape[1]
+        if self.config.use_diffusion_forcing:
+            # Diffusion Forcing: independent noise level per waypoint (B, T)
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (B, T),
+                device=device,
+            ).long()
+            alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(device)
+            sqrt_alpha    = alphas_cumprod[timesteps].sqrt()[..., None]         # (B, T, 1)
+            sqrt_1m_alpha = (1 - alphas_cumprod[timesteps]).sqrt()[..., None]   # (B, T, 1)
+            noisy_actions = sqrt_alpha * gt_actions_norm + sqrt_1m_alpha * noise
+        else:
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (B,),
+                device=device,
+            ).long()
+            noisy_actions = self.noise_scheduler.add_noise(gt_actions_norm, noise, timesteps)
 
         # Predict the noise
         pred_noise = self.denoiser(noisy_actions, timesteps, context)
@@ -514,8 +546,14 @@ class ActionDiffusionHead(nn.Module):
             x0 = self._get_gt_actions(gt_traj_dense, features)   # (B, 40, 2)
 
         # Sample a continuous time value per training sample
-        t = torch.rand(B, device=device)                        # (B,) ∈ [0, 1]
-        t_bcast = t[:, None, None]                              # (B, 1, 1) for broadcasting
+        T = x0.shape[1]
+        if self.config.use_diffusion_forcing:
+            # Diffusion Forcing: independent t per waypoint (B, T) ∈ [0, 1]
+            t = torch.rand(B, T, device=device)
+            t_bcast = t[..., None]                              # (B, T, 1) for broadcasting
+        else:
+            t = torch.rand(B, device=device)                    # (B,) ∈ [0, 1]
+            t_bcast = t[:, None, None]                          # (B, 1, 1) for broadcasting
 
         # Linear interpolation between clean actions and noise
         noise = torch.randn_like(x0)
@@ -524,7 +562,7 @@ class ActionDiffusionHead(nn.Module):
         # Ground-truth velocity
         target_v = noise - x0                                   # (B, 40, 2)
 
-        # Predict velocity (denoiser unchanged; t is now a float in [0,1])
+        # Predict velocity (denoiser unchanged; t is (B,) or (B,T) float in [0,1])
         pred_v = self.denoiser(x_t, t, context)
         return F.mse_loss(pred_v, target_v)
 
@@ -546,70 +584,155 @@ class ActionDiffusionHead(nn.Module):
             return self._flow_forward(context, features)
         return self._ddpm_forward(context, features)
 
-    def _ddpm_forward(
+    def _prepare_inference(
         self,
         context: torch.Tensor,
         features: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
+    ):
         """
-        Run DDPM reverse process and return trajectory proposals.
-
-        Args:
-            context:  (B, L, D)  — scene KV
-            features: feature dict (needs 'status_feature', 'hist_status_feature')
+        Shared boilerplate for all inference paths.
 
         Returns:
-            dp_pred:      (B, N, 8, 3)  — N sparse trajectory proposals [x,y,h]
-            pred_actions: (B, N, 40, 2) — corresponding raw (de-normalised) actions
+            ctx       : (B*N, L, D)       — context expanded for N proposals
+            hist_xyz  : (B*N, H+1, 3)
+            hist_rot  : (B*N, H+1, 3, 3)
+            t0_states : {'v': (B*N,)}
+            B, N, device, dtype
         """
         cfg = self.config
         B, device, dtype = context.shape[0], context.device, context.dtype
         N = cfg.num_inference_proposals
 
-        # Expand batch dimension for N parallel proposals
-        ctx = context.repeat_interleave(N, dim=0)       # (B*N, L, D)
-
+        ctx = context.repeat_interleave(N, dim=0)                    # (B*N, L, D)
         hist_xyz, hist_rot = self._build_history(features)
         hist_xyz = hist_xyz.repeat_interleave(N, dim=0)
         hist_rot = hist_rot.repeat_interleave(N, dim=0)
         v0 = features["status_feature"][:, 4].repeat_interleave(N)  # (B*N,)
         t0_states = {"v": v0}
 
-        # Start from pure Gaussian noise
-        shape = (B * N, cfg.internal_horizon, cfg.action_dim)
-        noise = torch.randn(shape, dtype=dtype, device=device)
+        return ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype
 
-        # Run full DDPM reverse chain
-        self.noise_scheduler.set_timesteps(
-            self.noise_scheduler.config.num_train_timesteps, device=device
-        )
-        for t in self.noise_scheduler.timesteps:
-            t_batch = t.expand(B * N)
-            pred_eps = self.denoiser(noise, t_batch, ctx)
-            noise = self.noise_scheduler.step(pred_eps, t, noise).prev_sample
-
-        # `noise` now contains denoised normalised actions
-        pred_actions_norm = noise
+    def _actions_to_output(
+        self,
+        pred_actions_norm: torch.Tensor,
+        hist_xyz: torch.Tensor,
+        hist_rot: torch.Tensor,
+        t0_states: dict,
+        B: int,
+        N: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Convert normalised action predictions to the standard output dict."""
+        cfg = self.config
         pred_actions_denorm = self._denormalize_actions(pred_actions_norm)
-
-        # Unicycle forward model: normalised actions → dense trajectory
         traj_xyz, traj_rot = self.action_space.action_to_traj(
             action=pred_actions_norm,
             t0_states=t0_states,
             traj_history_xyz=hist_xyz,
             traj_history_rot=hist_rot,
         )
-        pos_xy  = traj_xyz[..., :2]                        # (B*N, 40, 2)
-        heading = self._rot_to_heading(traj_rot)            # (B*N, 40, 1)
-        traj_dense = torch.cat([pos_xy, heading], dim=-1)  # (B*N, 40, 3)
-
-        # Down-sample: 40 steps at 0.1 s → 8 steps at 0.5 s (indices 4, 9, …, 39)
-        traj_sparse = traj_dense[:, 4::5, :]               # (B*N, 8, 3)
-
+        pos_xy      = traj_xyz[..., :2]
+        heading     = self._rot_to_heading(traj_rot)
+        traj_sparse = torch.cat([pos_xy, heading], dim=-1)[:, 4::5, :]  # (B*N, 8, 3)
         return {
             "dp_pred":      traj_sparse.view(B, N, 8, self._OUTPUT_DIM),
             "pred_actions": pred_actions_denorm.view(B, N, cfg.internal_horizon, cfg.action_dim),
         }
+
+    @staticmethod
+    def _build_pyramid_schedule(num_base_steps: int, num_tokens: int, offset: int) -> list:
+        """
+        Build the Diffusion Forcing scheduling matrix as a Python list-of-lists.
+
+            level[m][i] = clip(num_base_steps + i*offset − m,  0,  num_base_steps)
+
+        Two special cases:
+          • offset == 0  →  flat "full-sequence" schedule: all tokens at the same
+                            level per row.  This is standard (non-DF) sampling.
+          • offset >= 1  →  pyramid schedule: token i lags token 0 by i*offset steps,
+                            so near-future waypoints are denoised first.
+        """
+        total_steps = num_base_steps + (num_tokens - 1) * offset + 1
+        return [
+            [max(0, min(num_base_steps, num_base_steps + i * offset - m)) for i in range(num_tokens)]
+            for m in range(total_steps)
+        ]
+
+    def _ddpm_forward(
+        self,
+        context: torch.Tensor,
+        features: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        DDPM reverse process, unified for standard and Diffusion Forcing modes.
+
+        Standard mode (``use_diffusion_forcing=False``):
+            All waypoints share the same noise level at every step — a flat
+            "full-sequence" scheduling matrix (offset=0).  This is equivalent
+            to the standard DDPM reverse chain.
+
+        Diffusion Forcing mode (``use_diffusion_forcing=True``):
+            Near-future waypoints are denoised first; each subsequent waypoint
+            lags by ``int(uncertainty_scale)`` DDPM timesteps — a pyramid
+            scheduling matrix (offset >= 1).
+
+        The per-token DDPM posterior is computed from ``alphas_cumprod`` buffers,
+        which is equivalent to ``DDPMScheduler.step()`` when
+        ``num_inference_steps == num_train_timesteps``.
+        """
+        cfg = self.config
+        ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype = self._prepare_inference(context, features)
+
+        T_way  = cfg.internal_horizon
+        T_diff = self.noise_scheduler.config.num_train_timesteps
+
+        # offset=0  →  flat schedule (standard);  offset>=1  →  pyramid (DF).
+        offset = max(1, int(round(cfg.uncertainty_scale))) if cfg.use_diffusion_forcing else 0
+        sched  = self._build_pyramid_schedule(T_diff, T_way, offset)
+
+        # Precompute alpha-cumprod buffers for the per-token DDPM posterior step.
+        acp      = self.noise_scheduler.alphas_cumprod.to(device)           # (T_diff,)
+        acp_prev = torch.cat([torch.ones(1, device=device), acp[:-1]])      # ᾱ_{t-1}
+
+        # Start from pure Gaussian noise.
+        x = torch.randn(B * N, T_way, cfg.action_dim, dtype=dtype, device=device)
+
+        for m in range(len(sched) - 1):
+            from_lev = torch.tensor(sched[m],     dtype=torch.long, device=device)  # (T_way,)
+            to_lev   = torch.tensor(sched[m + 1], dtype=torch.long, device=device)
+
+            update_mask = from_lev > to_lev        # tokens whose level decreases this step
+            if not update_mask.any():
+                continue
+
+            # DDPMScheduler timestep index = level − 1  (level 0 → token is clean).
+            t_idx    = (from_lev - 1).clamp(min=0)                          # (T_way,)
+            t_idx_bn = t_idx[None].expand(B * N, -1)                        # (B*N, T_way)
+
+            # Standard mode: all tokens at the same level → pass scalar (B*N,) to
+            # keep the denoiser on its 1-time-token path (cond_pos sized accordingly).
+            t_in = t_idx_bn[:, 0] if not cfg.use_diffusion_forcing else t_idx_bn
+
+            pred_eps = self.denoiser(x, t_in, ctx)                          # (B*N, T_way, A)
+
+            # Per-token DDPM posterior  q(x_{t-1} | x_t, x̂_0).
+            a_t    = acp[t_idx_bn]       # (B*N, T_way)  ᾱ_t
+            a_prev = acp_prev[t_idx_bn]  # (B*N, T_way)  ᾱ_{t-1}
+            beta_t = 1.0 - a_t / a_prev
+
+            x0 = (x - (1.0 - a_t).sqrt()[..., None] * pred_eps) / a_t.sqrt()[..., None]
+            x0 = x0.clamp(-5.0, 5.0)    # matches scheduler clip_sample_range
+
+            post_mean = (
+                a_prev.sqrt()[..., None] * beta_t[..., None] / (1.0 - a_t)[..., None] * x0
+                + (a_t / a_prev).sqrt()[..., None] * (1.0 - a_prev)[..., None] / (1.0 - a_t)[..., None] * x
+            )
+            post_var = beta_t * (1.0 - a_prev) / (1.0 - a_t)
+            x_new = post_mean + post_var.clamp(min=1e-20).sqrt()[..., None] * torch.randn_like(x)
+
+            mask = update_mask[None, :, None].expand(B * N, -1, cfg.action_dim)
+            x    = torch.where(mask, x_new, x)
+
+        return self._actions_to_output(x, hist_xyz, hist_rot, t0_states, B, N)
 
     def _flow_forward(
         self,
@@ -617,63 +740,58 @@ class ActionDiffusionHead(nn.Module):
         features: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Flow matching inference via Euler integration (t = 1 → 0).
+        Flow-matching inference via Euler integration, unified for standard and
+        Diffusion Forcing modes.
 
-        Integrates the learned velocity field v_θ(x_t, t) with uniform step
-        size dt = 1 / num_flow_steps.  No external scheduler is needed.
+        Standard mode (``use_diffusion_forcing=False``):
+            All waypoints share the same t value (t_start=1 for all), integrating
+            from t=1 → 0 in ``num_flow_steps`` uniform steps.  The denoiser
+            receives a scalar (B*N,) timestep, identical to the original Euler loop.
 
-        Args:
-            context:  (B, L, D)  — scene KV
-            features: feature dict (needs 'status_feature', 'hist_status_feature')
+        Diffusion Forcing mode (``use_diffusion_forcing=True``):
+            Token i starts at  t_start[i] = clip(1 + i*offset*dt, 0, 1),  so
+            near-future waypoints reach t=0 before far-future ones.  The denoiser
+            receives a per-token (B*N, T_way) timestep.
 
-        Returns:
-            dp_pred:      (B, N, 8, 3)  — N sparse trajectory proposals [x,y,h]
-            pred_actions: (B, N, 40, 2) — corresponding raw (de-normalised) actions
+        Both modes share identical loop logic; only ``t_start`` and the shape of
+        the denoiser input differ.
         """
         cfg = self.config
-        B, device, dtype = context.shape[0], context.device, context.dtype
-        N = cfg.num_inference_proposals
+        ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype = self._prepare_inference(context, features)
 
-        # Expand batch dimension for N parallel proposals
-        ctx = context.repeat_interleave(N, dim=0)        # (B*N, L, D)
-
-        hist_xyz, hist_rot = self._build_history(features)
-        hist_xyz = hist_xyz.repeat_interleave(N, dim=0)
-        hist_rot = hist_rot.repeat_interleave(N, dim=0)
-        v0 = features["status_feature"][:, 4].repeat_interleave(N)  # (B*N,)
-        t0_states = {"v": v0}
-
-        # Start from pure Gaussian noise (t = 1)
-        x = torch.randn(B * N, cfg.internal_horizon, cfg.action_dim, dtype=dtype, device=device)
-
-        # Euler integration: t = 1 → 0  (step backwards along the probability path)
+        T_way   = cfg.internal_horizon
         n_steps = cfg.num_flow_steps
-        dt = 1.0 / n_steps
-        for i in range(n_steps, 0, -1):
-            t_val = i / n_steps                                       # scalar in (0, 1]
-            t_batch = torch.full((B * N,), t_val, dtype=dtype, device=device)
-            v = self.denoiser(x, t_batch, ctx)                        # predicted velocity
-            x = x - dt * v                                             # Euler step toward t=0
+        dt      = 1.0 / n_steps
+        i_arr   = torch.arange(T_way, device=device, dtype=dtype)
 
-        # `x` now contains denoised normalised actions (at t = 0 ≈ x₀)
-        pred_actions_norm = x
-        pred_actions_denorm = self._denormalize_actions(pred_actions_norm)
+        # Per-token integration start time.
+        # Standard (offset=0): t_start = 1 for all.
+        # DF (offset>=1):      t_start[i] = clip(1 + i*offset*dt, 0, 1).
+        if cfg.use_diffusion_forcing:
+            offset  = max(1, int(round(cfg.uncertainty_scale)))
+            t_start = (1.0 + i_arr * offset * dt).clamp(0.0, 1.0)          # (T_way,)
+        else:
+            t_start = torch.ones(T_way, device=device, dtype=dtype)         # (T_way,)
 
-        # Unicycle forward model: normalised actions → dense trajectory
-        traj_xyz, traj_rot = self.action_space.action_to_traj(
-            action=pred_actions_norm,
-            t0_states=t0_states,
-            traj_history_xyz=hist_xyz,
-            traj_history_rot=hist_rot,
-        )
-        pos_xy  = traj_xyz[..., :2]                        # (B*N, 40, 2)
-        heading = self._rot_to_heading(traj_rot)            # (B*N, 40, 1)
-        traj_dense = torch.cat([pos_xy, heading], dim=-1)  # (B*N, 40, 3)
+        total_outer = int(t_start.max().item() / dt) + 1
 
-        # Down-sample: 40 steps at 0.1 s → 8 steps at 0.5 s (indices 4, 9, …, 39)
-        traj_sparse = traj_dense[:, 4::5, :]               # (B*N, 8, 3)
+        # Start from pure Gaussian noise.
+        x = torch.randn(B * N, T_way, cfg.action_dim, dtype=dtype, device=device)
 
-        return {
-            "dp_pred":      traj_sparse.view(B, N, 8, self._OUTPUT_DIM),
-            "pred_actions": pred_actions_denorm.view(B, N, cfg.internal_horizon, cfg.action_dim),
-        }
+        for m in range(total_outer):
+            t_curr = (t_start - m * dt).clamp(0.0, 1.0)          # (T_way,)
+            t_next = (t_start - (m + 1) * dt).clamp(0.0, 1.0)
+
+            update_mask = t_curr > t_next
+            if not update_mask.any():
+                break
+
+            # Standard mode: all entries identical → collapse to scalar (B*N,) so the
+            # denoiser uses its 1-time-token path (cond_pos sized accordingly).
+            t_in = t_curr[None].expand(B * N, -1) if cfg.use_diffusion_forcing else t_curr[0].expand(B * N)
+
+            v    = self.denoiser(x, t_in, ctx)                    # (B*N, T_way, A)
+            mask = update_mask[None, :, None].expand(B * N, -1, cfg.action_dim)
+            x    = x - torch.where(mask, dt * v, torch.zeros_like(v))
+
+        return self._actions_to_output(x, hist_xyz, hist_rot, t0_states, B, N)
