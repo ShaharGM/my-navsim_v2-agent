@@ -18,6 +18,7 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from navsim.agents.gtrs_dense.hydra_backbone import HydraBackbone
 from navsim.agents.gtrs_dense.hydra_config import HydraConfig
@@ -264,15 +265,15 @@ class HydraTrajHead(nn.Module):
             result[k] = head(dist_status).squeeze(-1)
 
         scores = (
-                0.03 * result['imi'].softmax(-1).log() +
-                0.1 * result['traffic_light_compliance'].sigmoid().log() +
-                0.1 * result['no_at_fault_collisions'].sigmoid().log() +
-                0.9 * result['drivable_area_compliance'].sigmoid().log() +
-                0.2 * result['driving_direction_compliance'].sigmoid().log() +
+                0.03 * F.log_softmax(result['imi'], dim=-1) +
+                0.1 * F.logsigmoid(result['traffic_light_compliance']) +
+                0.1 * F.logsigmoid(result['no_at_fault_collisions']) +
+                0.9 * F.logsigmoid(result['drivable_area_compliance']) +
+                0.2 * F.logsigmoid(result['driving_direction_compliance']) +
                 6.0 * (7.0 * result['time_to_collision_within_bound'].sigmoid() +
                        7.0 * result['ego_progress'].sigmoid() +
                        3.0 * result['lane_keeping'].sigmoid()
-                       ).log()
+                       ).clamp(min=1e-6).log()
         )
 
 
@@ -337,15 +338,15 @@ class HydraTrajHead(nn.Module):
 
         # only dp: 87 > dp and vocab: 86.6
         scores = (
-                         0.01 * result['imi'].softmax(-1).log() +
-                         0.1 * result['traffic_light_compliance'].sigmoid().log() +
-                         0.5 * result['no_at_fault_collisions'].sigmoid().log() +
-                         0.5 * result['drivable_area_compliance'].sigmoid().log() +
-                         0.5 * result['driving_direction_compliance'].sigmoid().log() +
+                         0.01 * F.log_softmax(result['imi'], dim=-1) +
+                         0.1 * F.logsigmoid(result['traffic_light_compliance']) +
+                         0.5 * F.logsigmoid(result['no_at_fault_collisions']) +
+                         0.5 * F.logsigmoid(result['drivable_area_compliance']) +
+                         0.5 * F.logsigmoid(result['driving_direction_compliance']) +
                          3.0 * (5.0 * result['time_to_collision_within_bound'].sigmoid() +
                                 5.0 * result['ego_progress'].sigmoid() +
                                 2.0 * result['lane_keeping'].sigmoid()
-                                ).log()
+                                ).clamp(min=1e-6).log()
                  )
         
         k_val = max(topk, 1)

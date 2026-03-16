@@ -114,6 +114,17 @@ A plain `@dataclass` (no inheritance). All fields have defaults.
 | `num_flow_steps` | 20 | Euler integration steps at inference time (flow only) |
 | `use_diffusion_forcing` | False | Independent per-token noise levels at training + pyramid scheduling at inference (see §7.3) |
 | `uncertainty_scale` | 1.0 | Stagger between adjacent waypoints in the pyramid schedule (DDPM timesteps or Euler steps) |
+| `use_hydra_diffusion_guidance` | False | Enable stepwise guidance from a frozen Hydra scorer during inference |
+| `hydra_guidance_scale` | 0.2 | Strength of the scorer guidance update |
+| `hydra_guidance_every_steps` | 1 | Apply guidance every K denoising steps |
+| `hydra_guidance_max_grad_norm` | 5.0 | Per-sample L2 clip for guidance gradients in action space |
+| `hydra_scorer_checkpoint_path` | `""` | Required when guidance is enabled; path to Hydra scorer checkpoint |
+| `hydra_vocab_path` | `""` | Required when guidance is enabled; scorer trajectory vocabulary `.npy` |
+| `hydra_vocab_size` | 16384 | Hydra scorer vocabulary size |
+| `hydra_normalize_vocab_pos` | True | Hydra scorer positional normalisation toggle |
+| `hydra_backbone_type` | `"vov"` | Hydra scorer visual backbone type |
+| `hydra_fusion_layers` | 3 | Hydra scorer transformer fusion depth |
+| `hydra_vov_ckpt` | `""` | Optional scorer VoV checkpoint override; falls back to `vov_ckpt` |
 | `weight_decay` | 0.0 | Adam weight decay |
 | `dp_loss_weight` | 10.0 | Multiplier on the MSE diffusion loss |
 
@@ -301,6 +312,21 @@ level[m][i] = clip(num_base_steps + i*offset − m,  0,  num_base_steps)
 - `offset=0`: flat schedule — all tokens at the same level per row (standard sampling)
 - `offset≥1`: pyramid schedule — token `i` lags token `0` by `i*offset` steps (Diffusion Forcing)
 
+**`_compute_guidance_grad(actions_norm, ...)`** — computes stepwise scorer guidance:
+```python
+# x: current action sample in normalized action space
+x = actions_norm.detach().requires_grad_(True)
+dense_traj = _actions_to_dense_traj(x, ...)
+per_sample_score = scorer_guidance_fn(dense_traj, B, N)    # shape: (B*N,)
+grad = autograd.grad(per_sample_score.sum(), x)[0]         # ∇_x score
+
+# Optional per-sample L2 clipping in action space.
+if hydra_guidance_max_grad_norm > 0:
+  grad = clip_by_l2_norm_per_sample(grad)
+
+return grad.detach()
+```
+
 **DDPM (`_ddpm_forward`)** — unified for standard and Diffusion Forcing:
 ```python
 # offset=0 (standard) or int(uncertainty_scale) (DF)
@@ -317,6 +343,11 @@ for m in range(len(sched) - 1):
     # DF:       pass per-token t (B*N, T_way) — denoiser uses T time tokens in KV
     t_in = t_idx_bn[:, 0] if not use_diffusion_forcing else t_idx_bn
     pred_eps = denoiser(x, t_in, ctx)
+
+    if use_guidance and (m % hydra_guidance_every_steps == 0):
+        grad = _compute_guidance_grad(x, ..., scorer_guidance_fn)    # (B*N,T_way,A)
+        pred_eps = pred_eps - hydra_guidance_scale * sqrt(1-acp[t_idx_bn]) * grad
+
     # Per-token DDPM posterior q(x_{t-1} | x_t, x̂_0)
     x0    = (x - sqrt(1-acp[t_idx])*pred_eps) / sqrt(acp[t_idx])
     x_new = ddpm_posterior_sample(x0, x, t_idx)           # mean + variance
@@ -326,19 +357,35 @@ return _actions_to_output(x, ...)
 
 **Flow matching (`_flow_forward`)** — unified for standard and Diffusion Forcing:
 ```python
-# Standard:  t_start = ones(T_way)              — all tokens integrate from t=1
-# DF:        t_start[i] = 1 + i*offset*dt       — staggered start times
-t_start = ones(T_way) if not use_diffusion_forcing else (1 + i_arr*offset*dt).clamp(0,1)
-for m in range(total_outer):
-    t_curr  = (t_start - m*dt).clamp(0, 1)
-    t_next  = (t_start - (m+1)*dt).clamp(0, 1)
+# offset=0 (standard) or int(uncertainty_scale) (DF)
+offset = int(uncertainty_scale) if use_diffusion_forcing else 0
+sched  = _build_pyramid_schedule(num_flow_steps, T_way, offset)
+x = randn(B*N, T_way, A)
+for m in range(len(sched) - 1):
+    from_lev, to_lev = sched[m], sched[m+1]
+    t_curr = from_lev / num_flow_steps
+    t_next = to_lev / num_flow_steps
     update_mask = t_curr > t_next
-    # Standard: collapse to scalar (B*N,); DF: per-token (B*N, T_way)
-    t_in = t_curr[0].expand(B*N) if not use_diffusion_forcing else t_curr[None].expand(B*N,-1)
+    # Standard: scalar t (B*N,); DF: per-token t (B*N, T_way)
+    t_in = t_curr[0].expand(B*N) if not use_diffusion_forcing else t_curr[None].expand(B*N, -1)
     v = denoiser(x, t_in, ctx)
-    x = x - where(update_mask, dt*v, zeros_like(v))
+    step = (t_curr - t_next)[None, :, None]
+    x = x - step * v
+
+    if use_guidance and (m % hydra_guidance_every_steps == 0):
+        grad = _compute_guidance_grad(x, ..., scorer_guidance_fn)
+        x = x + hydra_guidance_scale * step * update_mask[..., None] * grad
 return _actions_to_output(x, ...)
 ```
+
+#### Guidance objective wiring (from `ad_agent.py`)
+When `use_hydra_diffusion_guidance=True`, the agent constructs a scorer callback:
+```python
+_guidance_fn(dense_traj, B, N):
+    out = hydra_scorer.evaluate_dp_proposals(..., dp_only_inference=True, topk=1)
+    return out["overall_log_scores"].reshape(B * N)
+```
+So guidance optimises `overall_log_scores` (not `overall_scores`).
 
 #### History construction (`_build_history`)
 `hist_status_feature` is a flat `(B, N_hist×7)` tensor.  
@@ -432,6 +479,10 @@ loss = diffusion_head.compute_loss(context_kv, gt_dense, features) * dp_loss_wei
 Schedulers: `None` | `"cosine"` (step) | `"step"` (epoch) | `"cycle"` (step, OneCycleLR) | `"plateau"` (epoch, monitors `"val/loss_epoch"`)
 
 `initialize()` — loads full Lightning checkpoint for inference; strips `"agent."` prefix from state_dict keys.
+
+Hydra scorer lifecycle (guidance mode):
+- scorer is built in `__init__` when `use_hydra_diffusion_guidance=True`
+- scorer is frozen (`eval()` + `requires_grad=False`) and used only to provide guidance gradients
 
 ---
 

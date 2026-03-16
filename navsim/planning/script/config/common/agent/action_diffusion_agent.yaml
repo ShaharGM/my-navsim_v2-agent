@@ -131,3 +131,22 @@ config:
   # ── Training ───────────────────────────────────────────────────────────────
   weight_decay: 0.0
   dp_loss_weight: 10.0
+
+  # ── Hydra Guidance During Denoising (inference only) ──────────────────────
+  # True diffusion guidance: at each DDPM/flow step, add scorer gradient
+  # to nudge samples toward higher Hydra log-score trajectories.
+  use_hydra_diffusion_guidance: false
+  hydra_guidance_scale: 0.2
+  hydra_guidance_every_steps: 1
+  hydra_guidance_max_grad_norm: 5.0
+
+  # Required when use_hydra_diffusion_guidance=true
+  hydra_scorer_checkpoint_path: ""
+  hydra_vocab_path: ""
+
+  # Scorer architecture defaults (match gtrs_dense_vov)
+  hydra_vocab_size: 16384
+  hydra_normalize_vocab_pos: true
+  hydra_backbone_type: "vov"
+  hydra_fusion_layers: 3
+  hydra_vov_ckpt: ""

@@ -62,18 +62,19 @@ class ActionDiffusionConfig:
     # -------------------------------------------------------------------
     # BEV backbone settings  (only used when backbone_type='bev')
     # -------------------------------------------------------------------
+    # BEV uses the shared img_vert_anchors × img_horz_anchors pool size as
+    # the per-view image token grid fed into the fusion transformer.
+    # The BEV output token count itself remains fixed at 8×8 = 64.
     bev_fusion_layers: int = 3        # TransformerEncoder depth
 
     # -------------------------------------------------------------------
     # Spatial pooling — defines how many image tokens are produced
     # -------------------------------------------------------------------
-    # Used by ALL backbone types.  The backbone's last feature map is
-    # pooled to (img_vert_anchors × img_horz_anchors) spatial positions.
-    #   • timm / vov  — these become the output tokens directly.
-    #   • bev         — these are the intermediate image tokens fed INTO
-    #                   the fusion transformer; the BEV output is always
-    #                   8×8 = 64 tokens (controlled by BEVBackbone._BEV_H/W).
-    # Defaults match gtrs_dp.ckpt: pos_emb shape = 2×(16×64)+64 = 2112.
+    # Used by all backbone types.
+    # The backbone's last feature map is pooled to
+    #   (img_vert_anchors × img_horz_anchors) spatial positions.
+    # For timm/vov each position becomes one diffusion-context token directly.
+    # For BEV these are intermediate per-view tokens before BEV fusion.
     img_vert_anchors: int = 16
     img_horz_anchors: int = 64
 
@@ -161,3 +162,33 @@ class ActionDiffusionConfig:
     # -------------------------------------------------------------------
     weight_decay: float = 0.0
     dp_loss_weight: float = 10.0
+
+    # -------------------------------------------------------------------
+    # Hydra guidance during diffusion / flow inference
+    # -------------------------------------------------------------------
+    # When enabled, each denoising step is nudged by the gradient of a
+    # pretrained Hydra scorer w.r.t. the current action sample.
+    use_hydra_diffusion_guidance: bool = False
+
+    # Guidance strength for the scorer gradient term.
+    hydra_guidance_scale: float = 0.2
+
+    # Apply guidance every K denoising steps (1 = every step).
+    hydra_guidance_every_steps: int = 1
+
+    # L2 clip on the per-sample guidance gradient in action space.
+    hydra_guidance_max_grad_norm: float = 5.0
+
+    # Hydra scorer checkpoint / vocabulary.
+    hydra_scorer_checkpoint_path: str = ""
+    hydra_vocab_path: str = ""
+
+    # Hydra scorer architecture knobs (defaults mirror gtrs_dense_vov).
+    hydra_vocab_size: int = 16384
+    hydra_normalize_vocab_pos: bool = True
+    hydra_backbone_type: str = "vov"
+    hydra_fusion_layers: int = 3
+
+    # Optional scorer-specific backbone checkpoint.
+    # If empty, falls back to `vov_ckpt`.
+    hydra_vov_ckpt: str = ""

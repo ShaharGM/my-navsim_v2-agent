@@ -9,7 +9,7 @@ Architecture
 ------------
 For each view (front, back):
     VoV V-99-eSE  →  AdaptiveAvgPool2d  →  (B, P, 1024) image tokens
-    where P = img_vert_anchors × img_horz_anchors  (e.g. 16×64 = 1024)
+    where P = img_vert_anchors × img_horz_anchors
 
 Concatenate front + back image tokens with learnable BEV queries:
     (B, 2P + Q, 1024)   where Q = bev_h × bev_w = 8×8 = 64
@@ -162,7 +162,7 @@ class BEVBackbone(BackboneBase):
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _encode_img(self, img: torch.Tensor) -> torch.Tensor:
-        """(B, 3, H, W) → (B, bev_img_vert_anchors × bev_img_horz_anchors, 1024)"""
+        """(B, 3, H, W) → (B, img_vert_anchors × img_horz_anchors, 1024)"""
         feat   = self.image_encoder(img)[-1]
         pooled = self.avgpool_img(feat)
         return pooled.flatten(-2, -1).permute(0, 2, 1)             # (B, P, 1024)

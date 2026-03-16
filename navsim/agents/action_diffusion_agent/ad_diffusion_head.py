@@ -40,7 +40,7 @@ matching uses a Fourier feature encoder for continuous t ∈ [0, 1].
 """
 
 import math
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -326,6 +326,7 @@ class ActionDiffusionHead(nn.Module):
 
     # Sparse output: (x, y, heading)
     _OUTPUT_DIM = 3
+    _GuidanceFn = Callable[[torch.Tensor, int, int], torch.Tensor]
 
     def __init__(self, config: ActionDiffusionConfig, context_len: int) -> None:
         super().__init__()
@@ -572,6 +573,7 @@ class ActionDiffusionHead(nn.Module):
         self,
         context: torch.Tensor,
         features: Dict[str, torch.Tensor],
+        scorer_guidance_fn: Optional[_GuidanceFn] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Dispatch to the appropriate inference loop based on ``config.noise_type``.
@@ -581,8 +583,8 @@ class ActionDiffusionHead(nn.Module):
             pred_actions: (B, N, 40, 2) — corresponding raw (de-normalised) actions
         """
         if self.config.noise_type == "flow":
-            return self._flow_forward(context, features)
-        return self._ddpm_forward(context, features)
+            return self._flow_forward(context, features, scorer_guidance_fn)
+        return self._ddpm_forward(context, features, scorer_guidance_fn)
 
     def _prepare_inference(
         self,
@@ -638,6 +640,70 @@ class ActionDiffusionHead(nn.Module):
             "pred_actions": pred_actions_denorm.view(B, N, cfg.internal_horizon, cfg.action_dim),
         }
 
+    def _actions_to_dense_traj(
+        self,
+        actions_norm: torch.Tensor,
+        hist_xyz: torch.Tensor,
+        hist_rot: torch.Tensor,
+        t0_states: dict,
+    ) -> torch.Tensor:
+        """Convert normalised actions (B*N, 40, 2) to dense SE2 traj (B*N, 40, 3)."""
+        traj_xyz, traj_rot = self.action_space.action_to_traj(
+            action=actions_norm,
+            t0_states=t0_states,
+            traj_history_xyz=hist_xyz,
+            traj_history_rot=hist_rot,
+        )
+        return torch.cat([traj_xyz[..., :2], self._rot_to_heading(traj_rot)], dim=-1)
+
+    def _compute_guidance_grad(
+        self,
+        actions_norm: torch.Tensor,
+        hist_xyz: torch.Tensor,
+        hist_rot: torch.Tensor,
+        t0_states: dict,
+        B: int,
+        N: int,
+        scorer_guidance_fn: Optional[_GuidanceFn],
+    ) -> Optional[torch.Tensor]:
+        """Compute ∇_x score(x) where x is the current action sample."""
+        if scorer_guidance_fn is None:
+            return None
+
+        with torch.enable_grad():
+            x = actions_norm.detach().requires_grad_(True)
+            dense_traj = self._actions_to_dense_traj(x, hist_xyz, hist_rot, t0_states)
+            per_sample_score = scorer_guidance_fn(dense_traj, B, N)
+            if per_sample_score.ndim != 1:
+                per_sample_score = per_sample_score.reshape(-1)
+            if per_sample_score.numel() != x.shape[0]:
+                raise RuntimeError(
+                    "scorer_guidance_fn must return one scalar score per proposal"
+                )
+
+            # # Optional guards against inf/nan values
+            # per_sample_score = torch.nan_to_num(per_sample_score, nan=-1e6, posinf=1e6, neginf=-1e6)
+
+            grad = torch.autograd.grad(
+                per_sample_score.sum(),
+                x,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+
+            # Prevent non-finite gradients from poisoning downstream updates.
+            grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+        max_norm = max(0.0, float(self.config.hydra_guidance_max_grad_norm))
+        if max_norm > 0.0:
+            grad_flat = grad.reshape(grad.shape[0], -1)
+            norms = grad_flat.norm(dim=1, keepdim=True).clamp_min(1e-6)
+            scale = torch.clamp(max_norm / norms, max=1.0)
+            grad = (grad_flat * scale).reshape_as(grad)
+
+        return grad.detach()
+
     @staticmethod
     def _build_pyramid_schedule(num_base_steps: int, num_tokens: int, offset: int) -> list:
         """
@@ -661,6 +727,7 @@ class ActionDiffusionHead(nn.Module):
         self,
         context: torch.Tensor,
         features: Dict[str, torch.Tensor],
+        scorer_guidance_fn: Optional[_GuidanceFn] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         DDPM reverse process, unified for standard and Diffusion Forcing modes.
@@ -681,6 +748,11 @@ class ActionDiffusionHead(nn.Module):
         """
         cfg = self.config
         ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype = self._prepare_inference(context, features)
+        use_guidance = (
+            scorer_guidance_fn is not None
+            and cfg.use_hydra_diffusion_guidance
+            and cfg.hydra_guidance_scale > 0.0
+        )
 
         T_way  = cfg.internal_horizon
         T_diff = self.noise_scheduler.config.num_train_timesteps
@@ -714,6 +786,22 @@ class ActionDiffusionHead(nn.Module):
 
             pred_eps = self.denoiser(x, t_in, ctx)                          # (B*N, T_way, A)
 
+            if use_guidance and (m % max(1, cfg.hydra_guidance_every_steps) == 0):
+                grad = self._compute_guidance_grad(
+                    x,
+                    hist_xyz,
+                    hist_rot,
+                    t0_states,
+                    B,
+                    N,
+                    scorer_guidance_fn,
+                )
+                if grad is not None:
+                    mask = update_mask[None, :, None].to(grad.dtype)
+                    grad = grad * mask
+                    # Classifier-guidance style correction on epsilon prediction.
+                    pred_eps = pred_eps - cfg.hydra_guidance_scale * (1.0 - acp[t_idx_bn]).sqrt()[..., None] * grad
+
             # Per-token DDPM posterior  q(x_{t-1} | x_t, x̂_0).
             a_t    = acp[t_idx_bn]       # (B*N, T_way)  ᾱ_t
             a_prev = acp_prev[t_idx_bn]  # (B*N, T_way)  ᾱ_{t-1}
@@ -738,6 +826,7 @@ class ActionDiffusionHead(nn.Module):
         self,
         context: torch.Tensor,
         features: Dict[str, torch.Tensor],
+        scorer_guidance_fn: Optional[_GuidanceFn] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Flow-matching inference via Euler integration, unified for standard and
@@ -777,6 +866,11 @@ class ActionDiffusionHead(nn.Module):
         """
         cfg = self.config
         ctx, hist_xyz, hist_rot, t0_states, B, N, device, dtype = self._prepare_inference(context, features)
+        use_guidance = (
+            scorer_guidance_fn is not None
+            and cfg.use_hydra_diffusion_guidance
+            and cfg.hydra_guidance_scale > 0.0
+        )
 
         T_way   = cfg.internal_horizon
         n_steps = cfg.num_flow_steps
@@ -817,5 +911,19 @@ class ActionDiffusionHead(nn.Module):
             # but we keep update_mask.any() above to skip the denoiser call).
             step = (t_curr - t_next)[None, :, None]               # (1, T_way, 1)
             x    = x - step * v
+
+            if use_guidance and (m % max(1, cfg.hydra_guidance_every_steps) == 0):
+                grad = self._compute_guidance_grad(
+                    x,
+                    hist_xyz,
+                    hist_rot,
+                    t0_states,
+                    B,
+                    N,
+                    scorer_guidance_fn,
+                )
+                if grad is not None:
+                    mask = update_mask[None, :, None].to(grad.dtype)
+                    x = x + cfg.hydra_guidance_scale * step * mask * grad
 
         return self._actions_to_output(x, hist_xyz, hist_rot, t0_states, B, N)

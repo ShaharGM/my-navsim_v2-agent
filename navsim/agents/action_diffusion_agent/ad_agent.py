@@ -19,7 +19,7 @@ trajectory candidates, and returns one randomly selected proposal.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import pytorch_lightning as pl
 import torch
@@ -46,6 +46,9 @@ from navsim.planning.training.abstract_feature_target_builder import (
     AbstractFeatureBuilder,
     AbstractTargetBuilder,
 )
+
+if TYPE_CHECKING:
+    from navsim.agents.gtrs_dense.gtrs_agent import GTRSAgent
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,92 @@ class ActionDiffusionAgent(AbstractAgent):
         self._total_train_steps = total_train_steps
 
         self.model = ActionDiffusionModel(config)
+        self._hydra_scorer_agent: Optional["GTRSAgent"] = self._build_hydra_scorer(config)
+        self._initialize_hydra_scorer()
+
+    def _build_hydra_scorer(self, config: ActionDiffusionConfig) -> Optional["GTRSAgent"]:
+        """Create scorer only when stepwise guidance is enabled."""
+        if not config.use_hydra_diffusion_guidance:
+            return None
+
+        if not config.hydra_scorer_checkpoint_path:
+            raise ValueError(
+                "use_hydra_diffusion_guidance=True requires hydra_scorer_checkpoint_path"
+            )
+        if not config.hydra_vocab_path:
+            raise ValueError(
+                "use_hydra_diffusion_guidance=True requires hydra_vocab_path"
+            )
+
+        from navsim.agents.gtrs_dense.gtrs_agent import GTRSAgent
+        from navsim.agents.gtrs_dense.hydra_config import HydraConfig
+
+        vov_ckpt = config.hydra_vov_ckpt or config.vov_ckpt
+        hydra_cfg = HydraConfig(
+            vocab_path=config.hydra_vocab_path,
+            vocab_size=config.hydra_vocab_size,
+            normalize_vocab_pos=config.hydra_normalize_vocab_pos,
+            backbone_type=config.hydra_backbone_type,
+            fusion_layers=config.hydra_fusion_layers,
+            use_back_view=False,  # Hydra scorer only uses front view for efficiency; no back-view doubling in token count
+            camera_width=config.camera_width,
+            camera_height=config.camera_height,
+            img_vert_anchors=config.img_vert_anchors,
+            img_horz_anchors=config.img_horz_anchors,
+            vov_ckpt=vov_ckpt,
+        )
+        return GTRSAgent(
+            config=hydra_cfg,
+            lr=self._lr,
+            checkpoint_path=config.hydra_scorer_checkpoint_path,
+        )
+
+    def _initialize_hydra_scorer(self) -> None:
+        """Load scorer checkpoint and freeze it for inference-time guidance."""
+        if self._hydra_scorer_agent is None:
+            return
+
+        logger.info("Loading Hydra scorer for diffusion guidance ...")
+        self._hydra_scorer_agent.initialize()
+        self._hydra_scorer_agent.eval()
+        for param in self._hydra_scorer_agent.parameters():
+            param.requires_grad = False
+        logger.info("Hydra scorer loaded.")
+
+    @staticmethod
+    def _prepare_scorer_features(features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Hydra scorer expects rear camera tensor as (B, 3, H, W) at inference."""
+        scorer_features = dict(features)
+        if "camera_feature_back" in scorer_features:
+            back = scorer_features["camera_feature_back"]
+            if isinstance(back, torch.Tensor) and back.ndim == 5:
+                scorer_features["camera_feature_back"] = back[:, -1]
+        return scorer_features
+
+    def _build_guidance_fn(
+        self,
+        features: Dict[str, torch.Tensor],
+    ) -> Optional[Callable[[torch.Tensor, int, int], torch.Tensor]]:
+        """Return scorer callback: dense traj (B*N, 40, 3) -> score (B*N,)."""
+        if self._hydra_scorer_agent is None:
+            return None
+
+        scorer_features = self._prepare_scorer_features(features)
+
+        def _guidance_fn(dense_traj: torch.Tensor, B: int, N: int) -> torch.Tensor:
+            dp_proposals = dense_traj.view(B, N, dense_traj.shape[1], dense_traj.shape[2])
+            out = self._hydra_scorer_agent.evaluate_dp_proposals(
+                scorer_features,
+                dp_proposals,
+                dp_only_inference=True,
+                topk=1,
+            )
+            scores = out["overall_log_scores"].reshape(B * N)
+            return scores
+            # Optional guards against inf/nan values
+            # return torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
+
+        return _guidance_fn
 
     # ──────────────────────────────────────────────── AbstractAgent API ───────
 
@@ -160,7 +249,10 @@ class ActionDiffusionAgent(AbstractAgent):
     def forward(
         self, features: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        return self.model(features)
+        guidance_fn = None
+        if not self.training:
+            guidance_fn = self._build_guidance_fn(features)
+        return self.model(features, scorer_guidance_fn=guidance_fn)
 
     # ────────────────────────────────────────────────────────── loss ──────────
 

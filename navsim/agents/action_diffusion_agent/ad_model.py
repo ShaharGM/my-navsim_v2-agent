@@ -26,7 +26,7 @@ When `pretrained_ckpt` is set, weights are loaded for any key that matches
 applied afterwards based solely on `freeze_backbone`.
 """
 
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -142,7 +142,9 @@ class ActionDiffusionModel(nn.Module):
     # ──────────────────────────────────────────────────────── forward ────────
 
     def forward(
-        self, features: Dict[str, torch.Tensor]
+        self,
+        features: Dict[str, torch.Tensor],
+        scorer_guidance_fn: Optional[Callable[[torch.Tensor, int, int], torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass.
@@ -173,7 +175,11 @@ class ActionDiffusionModel(nn.Module):
             # Return a zero placeholder so the framework doesn't break.
             out["trajectory"] = torch.zeros(B, 8, 3, device=device)
         else:
-            head_out = self.diffusion_head(context, features)
+            head_out = self.diffusion_head(
+                context,
+                features,
+                scorer_guidance_fn=scorer_guidance_fn,
+            )
             out.update(head_out)
 
             # Pick one proposal at random as the "committed" trajectory.

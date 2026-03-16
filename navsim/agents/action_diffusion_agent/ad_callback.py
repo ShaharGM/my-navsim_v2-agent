@@ -15,7 +15,6 @@ or any components outside of the core agent.
 import logging
 from typing import Optional
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pytorch_lightning as pl
@@ -23,7 +22,6 @@ import torch
 
 from navsim.agents.action_diffusion_agent.ad_config import ActionDiffusionConfig
 
-matplotlib.use("Agg")   # Non-interactive backend — safe in training workers
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +40,9 @@ class ActionDiffusionCallback(pl.Callback):
         num_samples: int = 4,
     ) -> None:
         super().__init__()
+        # Use a non-interactive backend only for training callback execution.
+        # Keeping this here avoids changing matplotlib backend at import time.
+        plt.switch_backend("Agg")
         self._config = config
         self.num_samples = num_samples
 
