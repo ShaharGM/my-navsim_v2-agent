@@ -4,7 +4,7 @@ echo "----------------------------------------------------------------"
 echo "GPUs Detected: $NUM_GPUS"
 echo "----------------------------------------------------------------"
 
-TRAIN_TEST_SPLIT=navmini
+TRAIN_TEST_SPLIT=navtrain
 
 # Find a free port automatically
 MASTER_PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
@@ -15,12 +15,11 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         agent=action_diffusion_agent \
         experiment_name=training_action_diffusion_agent \
         train_test_split=$TRAIN_TEST_SPLIT \
-        dataloader.params.batch_size=8 \
-        trainer.params.accumulate_grad_batches=1 \
-        trainer.params.max_epochs=20000 \
+        dataloader.params.batch_size=32 \
+        trainer.params.accumulate_grad_batches=2 \
+        trainer.params.max_epochs=100 \
         trainer.params.strategy=ddp_find_unused_parameters_true \
         agent.lr=1e-5 \
-        +debug_overfit=True \
         agent.config.backbone_type="bev" \
         agent.config.freeze_backbone=True \
         agent.config.bev_ckpt=$NAVSIM_DEVKIT_ROOT/weights/gtrs_dp.ckpt \
@@ -28,6 +27,6 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         agent.config.noise_type="ddpm" \
         agent.config.num_inference_proposals=100 \
         agent.config.num_diffusion_layers=5 \
-        cache_path="${NAVSIM_EXP_ROOT}/training_cache_navmini/" \
+        cache_path="${NAVSIM_EXP_ROOT}/training_cache/" \
         use_cache_without_dataset=True \
         force_cache_computation=False

@@ -35,7 +35,7 @@ from navsim.agents.action_diffusion_agent.ad_features import (
     ActionDiffusionTargetBuilder,
 )
 from navsim.agents.action_diffusion_agent.backbones import build_backbone
-from navsim.common.dataclasses import SceneFilter
+from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader
 
 
@@ -131,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run backbone on.",
     )
+    parser.add_argument(
+        "--sample_stride",
+        type=int,
+        default=1,
+        help="Sample every Nth scene (stride > 1 to skip consecutive scenes for debugging).",
+    )
 
     return parser.parse_args()
 
@@ -179,10 +185,22 @@ def get_scene_loader(
     logger.info(f"  Log path: {data_path}")
     logger.info(f"  Sensor path: {sensor_path}")
 
+    # Request camera history frames through a compact config helper.
+    all_frames = list(range(scene_filter.num_history_frames))
+    sensor_config = SensorConfig.build_all_sensors(include=all_frames)
+    sensor_config.lidar_pc = []
+    sensor_config.cam_l1 = []
+    sensor_config.cam_r1 = []
+    if not config.use_back_view:
+        sensor_config.cam_l2 = []
+        sensor_config.cam_r2 = []
+        sensor_config.cam_b0 = []
+
     scene_loader = SceneLoader(
         original_sensor_path=sensor_path,
         data_path=data_path,
         scene_filter=scene_filter,
+        sensor_config=sensor_config,
     )
 
     logger.info(f"Total scenes in {args.train_test_split}: {len(scene_loader)}")
@@ -276,8 +294,16 @@ def extract_perception_trajectory_pairs(
         num_scenes = min(args.max_scenes, num_scenes)
 
     logger.info(f"Processing {num_scenes} scenes...")
-
-    for idx in tqdm(range(num_scenes), desc="Extracting perception-trajectory pairs"):
+    
+    # Determine which scene indices to process based on stride
+    stride = args.sample_stride
+    if stride > 1:
+        scene_indices = list(range(0, num_scenes, stride))
+        logger.info(f"Using stride={stride}: sampling {len(scene_indices)} scenes (skip ratio: {stride}x)")
+    else:
+        scene_indices = list(range(num_scenes))
+    
+    for count, idx in enumerate(tqdm(scene_indices, desc="Extracting perception-trajectory pairs")):
         try:
             token = scene_loader.tokens[idx]
             scene = scene_loader.get_scene_from_token(token)
@@ -299,9 +325,19 @@ def extract_perception_trajectory_pairs(
                     backbone_inputs["camera_feature_back"] = (
                         features["camera_feature_back"].unsqueeze(0).to(args.device)
                     )
+                
+                # DEBUG: Log camera feature stats to check if they vary
+                camera_feat = backbone_inputs["camera_feature"]
+                if count < 3:
+                    logger.info(f"Scene {idx} token={token}: camera_feature min/max/mean = {camera_feat.min().item():.4f}/{camera_feat.max().item():.4f}/{camera_feat.mean().item():.4f}")
+                
                 backbone_tokens = backbone(backbone_inputs)  # (1, N_tokens, C)
                 perception_vec = backbone_tokens.mean(dim=1)  # (1, C)
                 perception_vec = perception_vec.squeeze(0)  # (C,)
+                
+                # DEBUG: Log perception vector stats
+                if count < 3:
+                    logger.info(f"  → perception_vec min/max/mean = {perception_vec.min().item():.4f}/{perception_vec.max().item():.4f}/{perception_vec.mean().item():.4f}")
 
             perception_list.append(perception_vec.cpu())
             trajectory_list.append(gt_trajectory)
