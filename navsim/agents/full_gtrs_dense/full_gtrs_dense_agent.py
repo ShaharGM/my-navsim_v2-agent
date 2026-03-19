@@ -12,15 +12,15 @@ from navsim.planning.training.abstract_feature_target_builder import (
 )
 
 from navsim.agents.gtrs_dense.gtrs_agent import GTRSAgent
-# from navsim.agents.full_gtrs_dense.action_dp_agent.dp_agent import DPAgent
-from navsim.agents.dp.dp_agent import DPAgent
+from navsim.agents.full_gtrs_dense.action_dp_agent.dp_agent import DPAgent
+# from navsim.agents.dp.dp_agent import DPAgent
 
 from navsim.agents.gtrs_dense.hydra_config import HydraConfig
-# from navsim.agents.full_gtrs_dense.action_dp_agent.dp_config import DPConfig
-from navsim.agents.dp.dp_config import DPConfig
+from navsim.agents.full_gtrs_dense.action_dp_agent.dp_config import DPConfig
+# from navsim.agents.dp.dp_config import DPConfig
 
-# from navsim.agents.full_gtrs_dense.action_dp_agent.dp_features import DPFeatureBuilder, DPTargetBuilder
-from navsim.agents.gtrs_dense.hydra_features import HydraFeatureBuilder, HydraTargetBuilder
+from navsim.agents.full_gtrs_dense.action_dp_agent.dp_features import DPFeatureBuilder, DPTargetBuilder
+# from navsim.agents.gtrs_dense.hydra_features import HydraFeatureBuilder, HydraTargetBuilder
 
 class FullGTRSAgent(AbstractAgent):
     def __init__(
@@ -76,11 +76,11 @@ class FullGTRSAgent(AbstractAgent):
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
         # return [DPTargetBuilder(config=self._dp_config)]
-        return [HydraTargetBuilder(config=self._dp_config)]
+        return [DPTargetBuilder(config=self._dp_config)]
 
     def get_feature_builders(self) -> List[AbstractFeatureBuilder]:
         # return [DPFeatureBuilder(config=self._dp_config)]
-        return [HydraFeatureBuilder(config=self._dp_config)]
+        return [DPFeatureBuilder(config=self._dp_config)]
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         dp_prop = self.dp_agent(features)

@@ -93,6 +93,23 @@ config:
   # ── Ego-status ─────────────────────────────────────────────────────────────
   ego_status_dim: 8       # [cmd(4), vx(1), vy(1), ax(1), ay(1)]
 
+  # ── Nearest-neighbor GT trajectory context (optional) ─────────────────────
+  # When enabled, the model computes a perception vector from current backbone
+  # tokens, retrieves the nearest scene from an offline memory bank, encodes
+  # that scene's GT dense trajectory, and appends it as one extra context token.
+  # Expected nn_memory_path payload:
+  #   {nn_memory_perception_key: Tensor[N, D],
+  #    nn_memory_trajectory_key: Tensor[N, T, 3]}
+  # where trajectory channels are (x, y, heading).
+  # A tuple/list (perception_bank, trajectory_bank) is also accepted.
+  use_nn_trajectory_context: false
+  nn_memory_path: ""                 # required when use_nn_trajectory_context=true
+  nn_memory_perception_key: "perception_vectors"
+  nn_memory_trajectory_key: "gt_trajectories"
+  nn_memory_metric: "cosine"         # 'cosine' or 'l2'
+  nn_trajectory_steps: 8
+  nn_trajectory_dim: 3
+
   # ── Diffusion head ─────────────────────────────────────────────────────────
   num_diffusion_layers: 4
   num_diffusion_timesteps: 100

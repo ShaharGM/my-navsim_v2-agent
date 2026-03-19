@@ -93,6 +93,24 @@ class ActionDiffusionConfig:
     ego_status_dim: int = 8
 
     # -------------------------------------------------------------------
+    # Nearest-neighbor trajectory context (optional)
+    # -------------------------------------------------------------------
+    # When enabled, the model retrieves the GT dense trajectory of the
+    # nearest scene from an offline memory bank using a perception vector
+    # extracted from the current backbone tokens.
+    use_nn_trajectory_context: bool = False
+    # Path to a torch-serialized retrieval bank file.
+    nn_memory_path: str = ""
+    # Keys used to read tensors from the retrieval bank when it is a dict.
+    nn_memory_perception_key: str = "perception_vectors"
+    nn_memory_trajectory_key: str = "gt_trajectories"
+    # Distance metric for nearest-neighbor lookup: 'cosine' or 'l2'.
+    nn_memory_metric: str = "cosine"
+    # Expected dense trajectory shape stored in the bank.
+    nn_trajectory_steps: int = 8
+    nn_trajectory_dim: int = 3
+
+    # -------------------------------------------------------------------
     # Diffusion head
     # -------------------------------------------------------------------
     num_diffusion_layers: int = 4      # TransformerDecoder layers in denoiser

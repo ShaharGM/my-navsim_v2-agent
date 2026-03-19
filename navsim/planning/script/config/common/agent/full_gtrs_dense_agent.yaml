@@ -19,7 +19,7 @@ _convert_: 'all'
 # pdm_gt_path: null
 
 dp_config:
-  _target_: navsim.agents.dp.dp_config.DPConfig
+  _target_: navsim.agents.full_gtrs_dense.action_dp_agent.dp_config.DPConfig
   _convert_: 'all'
   seq_len: 2
   ckpt_path: dp_ckpt

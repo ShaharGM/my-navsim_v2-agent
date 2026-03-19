@@ -57,7 +57,7 @@ action_diffusion_agent/
 ├── __init__.py               public API exports
 ├── ad_config.py              ActionDiffusionConfig dataclass (all hyperparams)
 ├── ad_diffusion_head.py      DDPM / Flow Matching head + DenoisingTransformer + physics
-├── ad_model.py               ActionDiffusionModel (wires backbone→context→head)
+├── ad_model.py               ActionDiffusionModel (wires backbone→context→head + optional NN trajectory token)
 ├── ad_features.py            Feature/target builders (NAVSIM AbstractFeatureBuilder)
 ├── ad_agent.py               ActionDiffusionAgent (NAVSIM AbstractAgent)
 ├── ad_callback.py            TensorBoard visualisation callback
@@ -798,3 +798,9 @@ Net effect: training unchanged, inference 10× faster, slight reduction in traje
 10. **Flow matching time embedding uses `_FourierEncoder`, not `_SinusoidalPosEmb`.** `_SinusoidalPosEmb` is designed for integer inputs and produces near-zero output for small floats in [0,1]. Always check that `_DenoisingTransformer` was constructed with `noise_type='flow'` when loading a flow matching checkpoint.
 
 11. **`noise_type` is baked into the model at construction time** (it selects the time embedding class). A DDPM-trained checkpoint cannot be used with `noise_type='flow'` or vice versa — the `denoiser.time_emb` weights would be incompatible.
+
+12. **Nearest-neighbor GT trajectory context (optional).**
+  - Controlled by `use_nn_trajectory_context`.
+  - At init, the model loads an offline bank from `nn_memory_path` containing perception vectors and dense GT trajectories.
+  - At each forward pass, it computes a query perception vector by averaging backbone tokens, retrieves the nearest bank entry (`cosine` or `l2`), encodes the retrieved dense trajectory with a small MLP (`Linear + LayerNorm`), and appends this as one additional context token before diffusion.
+  - Because the denoiser uses fixed positional parameters sized by context length, this feature reserves the extra token slot at model construction time (`context_len += 1` when enabled).

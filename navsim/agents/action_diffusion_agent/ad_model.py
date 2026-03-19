@@ -26,14 +26,141 @@ When `pretrained_ckpt` is set, weights are loaded for any key that matches
 applied afterwards based solely on `freeze_backbone`.
 """
 
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from navsim.agents.action_diffusion_agent.ad_config import ActionDiffusionConfig
 from navsim.agents.action_diffusion_agent.backbones import build_backbone
 from navsim.agents.action_diffusion_agent.ad_diffusion_head import ActionDiffusionHead
+
+
+class _PerceptionTrajectoryMemory:
+    """Offline nearest-neighbor memory bank for perception -> GT trajectory retrieval.
+
+    Expected payload format (recommended):
+        {
+            <perception_key>: Tensor[N, D],
+            <trajectory_key>: Tensor[N, T, 3],
+        }
+    where trajectory channels are (x, y, heading).
+    """
+
+    def __init__(self, config: ActionDiffusionConfig) -> None:
+        if not config.nn_memory_path:
+            raise ValueError("nn_memory_path must be set when use_nn_trajectory_context=True")
+
+        self._metric = config.nn_memory_metric.lower()
+        if self._metric not in {"cosine", "l2"}:
+            raise ValueError(
+                f"Unsupported nn_memory_metric={config.nn_memory_metric!r}; expected 'cosine' or 'l2'."
+            )
+
+        payload = torch.load(config.nn_memory_path, map_location="cpu", weights_only=False)
+        perception, trajectories = self._extract(
+            payload,
+            config.nn_memory_perception_key,
+            config.nn_memory_trajectory_key,
+        )
+        perception = perception.float().contiguous().cpu()
+        trajectories = self._format_trajectories(
+            trajectories,
+            config.nn_trajectory_steps,
+            config.nn_trajectory_dim,
+        ).float().contiguous().cpu()
+
+        if perception.ndim != 2:
+            raise ValueError(
+                f"Perception tensor must be rank-2 [M, C], got shape {tuple(perception.shape)}"
+            )
+        if perception.shape[0] != trajectories.shape[0]:
+            raise ValueError(
+                "Perception and trajectory bank sizes must match; got "
+                f"{perception.shape[0]} vs {trajectories.shape[0]}."
+            )
+
+        self._perception = perception
+        self._trajectories = trajectories
+        if self._metric == "cosine":
+            self._perception_norm = F.normalize(self._perception, dim=-1)
+            self._perception_sq = None
+        else:
+            self._perception_norm = None
+            self._perception_sq = (self._perception ** 2).sum(dim=-1)
+
+    @staticmethod
+    def _extract(
+        payload: Any,
+        perception_key: str,
+        trajectory_key: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(payload, dict):
+            if perception_key in payload and trajectory_key in payload:
+                return torch.as_tensor(payload[perception_key]), torch.as_tensor(payload[trajectory_key])
+            raise KeyError(
+                "Retrieval payload must contain configured bank keys "
+                f"{perception_key!r} and {trajectory_key!r}."
+            )
+
+        if isinstance(payload, (list, tuple)) and len(payload) == 2:
+            return torch.as_tensor(payload[0]), torch.as_tensor(payload[1])
+
+        raise TypeError(
+            "Unsupported retrieval bank format. Expected either: "
+            "dict with configured keys, or 2-item tuple/list "
+            "(perception_bank, trajectory_bank)."
+        )
+
+    @staticmethod
+    def _format_trajectories(
+        trajectories: torch.Tensor,
+        steps: int,
+        dim: int,
+    ) -> torch.Tensor:
+        if trajectories.ndim == 3:
+            if tuple(trajectories.shape[1:]) != (steps, dim):
+                raise ValueError(
+                    f"Trajectory shape mismatch: expected [M, {steps}, {dim}], got {tuple(trajectories.shape)}"
+                )
+            if dim != 3:
+                raise ValueError(
+                    f"Expected trajectory dim=3 for (x, y, heading), got dim={dim}."
+                )
+            return trajectories
+        if trajectories.ndim == 2:
+            if trajectories.shape[1] != steps * dim:
+                raise ValueError(
+                    f"Flattened trajectory dim mismatch: expected {steps * dim}, got {trajectories.shape[1]}"
+                )
+            return trajectories.view(-1, steps, dim)
+        raise ValueError(
+            "Trajectory tensor must be rank-2 [M, steps*dim] or rank-3 [M, steps, dim], "
+            f"got {tuple(trajectories.shape)}"
+        )
+
+    @torch.no_grad()
+    def query(self, perception_query: torch.Tensor) -> torch.Tensor:
+        query = perception_query.detach().float().cpu()
+        if query.ndim != 2:
+            raise ValueError(
+                f"Perception query must be rank-2 [B, C], got shape {tuple(query.shape)}"
+            )
+        if query.shape[1] != self._perception.shape[1]:
+            raise ValueError(
+                "Perception query dim mismatch: "
+                f"query C={query.shape[1]}, bank C={self._perception.shape[1]}."
+            )
+
+        if self._metric == "cosine":
+            query = F.normalize(query, dim=-1)
+            nn_idx = (query @ self._perception_norm.t()).argmax(dim=-1)
+        else:
+            q_sq = (query ** 2).sum(dim=-1, keepdim=True)
+            dist = q_sq + self._perception_sq.unsqueeze(0) - 2.0 * (query @ self._perception.t())
+            nn_idx = dist.argmin(dim=-1)
+        return self._trajectories[nn_idx]
 
 
 class ActionDiffusionModel(nn.Module):
@@ -41,6 +168,7 @@ class ActionDiffusionModel(nn.Module):
     def __init__(self, config: ActionDiffusionConfig) -> None:
         super().__init__()
         self.config = config
+        self._use_nn_trajectory_context = bool(config.use_nn_trajectory_context)
 
         # ── Perception backbone ───────────────────────────────────────────────
         self.backbone = build_backbone(config)
@@ -59,8 +187,17 @@ class ActionDiffusionModel(nn.Module):
             nn.LayerNorm(config.model_dim),
         )
 
+        self._nn_memory: Optional[_PerceptionTrajectoryMemory] = None
+        if self._use_nn_trajectory_context:
+            self._nn_memory = _PerceptionTrajectoryMemory(config)
+            self.nn_traj_encoder = nn.Sequential(
+                nn.Linear(config.nn_trajectory_steps * config.nn_trajectory_dim, config.model_dim),
+                nn.LayerNorm(config.model_dim),
+            )
+
         # ── Learnable positional embedding ────────────────────────────────────
-        self._context_len = num_img_tokens + 1
+        extra_tokens = 1 if self._use_nn_trajectory_context else 0
+        self._context_len = num_img_tokens + 1 + extra_tokens
         self.pos_embedding = nn.Embedding(self._context_len, config.model_dim)
 
         # ── Diffusion head ────────────────────────────────────────────────────
@@ -128,14 +265,27 @@ class ActionDiffusionModel(nn.Module):
 
         # The backbone owns all image extraction; it receives the full
         # features dict and returns (B, num_tokens, out_channels).
-        tokens = self.img_proj(self.backbone(features))           # (B, N, D)
+        backbone_tokens = self.backbone(features)                 # (B, N, C)
+        tokens = self.img_proj(backbone_tokens)                   # (B, N, D)
 
         # --- Ego-status token ---
         status = features["status_feature"][:, : cfg.ego_status_dim]  # (B, 8)
         status_tok = self.status_encoder(status).unsqueeze(1)          # (B, 1, D)
 
+        context_tokens = [tokens, status_tok]
+
+        if self._use_nn_trajectory_context:
+            assert self._nn_memory is not None
+            perception_vec = backbone_tokens.mean(dim=1)                  # (B, C)
+            nn_traj = self._nn_memory.query(perception_vec).to(
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )                                                             # (B, S, 3)
+            nn_tok = self.nn_traj_encoder(nn_traj.flatten(start_dim=1)).unsqueeze(1)
+            context_tokens.append(nn_tok)                                 # (B, 1, D)
+
         # --- Assemble context ---
-        context = torch.cat([tokens, status_tok], dim=1)          # (B, N+1, D)
+        context = torch.cat(context_tokens, dim=1)                # (B, N+1(+1), D)
         context = context + self.pos_embedding.weight[None, :]    # broadcast positional bias
         return context
 

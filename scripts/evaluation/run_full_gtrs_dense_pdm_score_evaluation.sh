@@ -7,7 +7,7 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
 	train_test_split=$TRAIN_TEST_SPLIT \
 	agent=full_gtrs_dense_agent \
 	worker=ray_distributed \
-	agent.dp_checkpoint_path="/sci/labs/sagieb/dawndude/projects/navsim_workspace/navsim/models/weights/gtrs_dp_seed_0_navtrain_retrained.ckpt" \
+	agent.dp_checkpoint_path="/sci/labs/sagieb/dawndude/projects/navsim_workspace/exp/training_action_dp_agent/2026.03.08.13.47.40/lightning_logs/version_29570942/checkpoints/epoch_098-val_loss_0.8447.ckpt" \
 	agent.scorer_checkpoint_path="/sci/labs/sagieb/dawndude/projects/navsim_workspace/navsim/models/gtrs_dense_vov.ckpt" \
 	agent.hydra_config.vocab_path=${NAVSIM_DEVKIT_ROOT}/traj_final/8192.npy \
 	experiment_name=full_gtrs_dense_agent_eval \
