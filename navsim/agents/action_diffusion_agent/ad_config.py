@@ -107,7 +107,7 @@ class ActionDiffusionConfig:
     # Distance metric for nearest-neighbor lookup: 'cosine' or 'l2'.
     nn_memory_metric: str = "cosine"
     # Expected dense trajectory shape stored in the bank.
-    nn_trajectory_steps: int = 8
+    nn_trajectory_steps: int = 40
     nn_trajectory_dim: int = 3
 
     # -------------------------------------------------------------------
