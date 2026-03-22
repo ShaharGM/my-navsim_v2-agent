@@ -28,6 +28,7 @@ applied afterwards based solely on `freeze_backbone`.
 
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import faiss
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -83,12 +84,43 @@ class _PerceptionTrajectoryMemory:
 
         self._perception = perception
         self._trajectories = trajectories
-        if self._metric == "cosine":
-            self._perception_norm = F.normalize(self._perception, dim=-1)
-            self._perception_sq = None
+        self._use_faiss = config.use_faiss_retrieval
+        self._faiss_index = None
+
+        if self._use_faiss:
+            # For cosine: normalize vectors so L2 distance approximates cosine distance.
+            if self._metric == "cosine":
+                perception_for_index = F.normalize(perception, dim=-1).numpy()
+            else:
+                perception_for_index = perception.numpy()
+
+            # FAISS HNSW is CPU-native; keep this path intentionally simple.
+            dim = self._perception.shape[1]
+            self._faiss_index = faiss.IndexHNSWFlat(dim, 16)
+            if hasattr(self._faiss_index, "hnsw") and hasattr(self._faiss_index.hnsw, "efSearch"):
+                self._faiss_index.hnsw.efSearch = 40
+            elif hasattr(self._faiss_index, "efSearch"):
+                self._faiss_index.efSearch = 40
+
+            self._faiss_index.add(perception_for_index)
+            print(
+                "[_PerceptionTrajectoryMemory] "
+                f"FAISS CPU HNSW index built, metric={self._metric}, "
+                f"size={len(self._perception)}"
+            )
         else:
-            self._perception_norm = None
-            self._perception_sq = (self._perception ** 2).sum(dim=-1)
+            # Pre-compute for brute-force methods
+            if self._metric == "cosine":
+                self._perception_norm = F.normalize(self._perception, dim=-1)
+                self._perception_sq = None
+            else:
+                self._perception_norm = None
+                self._perception_sq = (self._perception ** 2).sum(dim=-1)
+            print(
+                "[_PerceptionTrajectoryMemory] "
+                f"Brute-force retrieval setup, metric={self._metric}, "
+                f"size={len(self._perception)}"
+            )
 
     @staticmethod
     def _extract(
@@ -153,13 +185,24 @@ class _PerceptionTrajectoryMemory:
                 f"query C={query.shape[1]}, bank C={self._perception.shape[1]}."
             )
 
-        if self._metric == "cosine":
-            query = F.normalize(query, dim=-1)
-            nn_idx = (query @ self._perception_norm.t()).argmax(dim=-1)
+        if self._use_faiss:
+            # FAISS search
+            if self._metric == "cosine":
+                query_for_search = F.normalize(query, dim=-1).numpy()
+            else:
+                query_for_search = query.numpy()
+            _, nn_idx = self._faiss_index.search(query_for_search, k=1)
+            nn_idx = nn_idx.flatten()
         else:
-            q_sq = (query ** 2).sum(dim=-1, keepdim=True)
-            dist = q_sq + self._perception_sq.unsqueeze(0) - 2.0 * (query @ self._perception.t())
-            nn_idx = dist.argmin(dim=-1)
+            # Brute-force search
+            if self._metric == "cosine":
+                query_norm = F.normalize(query, dim=-1)
+                nn_idx = (query_norm @ self._perception_norm.t()).argmax(dim=-1)
+            else:
+                q_sq = (query ** 2).sum(dim=-1, keepdim=True)
+                dist = q_sq + self._perception_sq.unsqueeze(0) - 2.0 * (query @ self._perception.t())
+                nn_idx = dist.argmin(dim=-1)
+
         return self._trajectories[nn_idx]
 
 

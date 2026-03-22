@@ -226,10 +226,15 @@ def _resolve_data_and_filter(
     scene_filter_cfg = OmegaConf.load(scene_filter_cfg_path)
     scene_filter: SceneFilter = instantiate(scene_filter_cfg)
 
-    required_future = int(config.internal_horizon)
+    # Scene loader should provide sparse future frames at dataset rate (2 Hz).
+    # Dense 40-step (0.1 s) trajectory is produced later by interpolation
+    # inside ActionDiffusionTargetBuilder.
+    required_future = int(
+        config.trajectory_sampling.time_horizon / config.trajectory_sampling.interval_length
+    )
     if scene_filter.num_future_frames < required_future:
         logger.warning(
-            "Scene filter future horizon (%d) is smaller than required internal horizon (%d). "
+            "Scene filter future horizon (%d) is smaller than required sparse horizon (%d). "
             "Overriding num_future_frames to %d.",
             scene_filter.num_future_frames,
             required_future,

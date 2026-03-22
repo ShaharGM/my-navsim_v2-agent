@@ -15,6 +15,7 @@
 *.pkl
 *.jpg
 *.pcd
+*.png
 
 # exp
 exp

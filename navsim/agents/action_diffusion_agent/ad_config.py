@@ -109,6 +109,8 @@ class ActionDiffusionConfig:
     # Expected dense trajectory shape stored in the bank.
     nn_trajectory_steps: int = 40
     nn_trajectory_dim: int = 3
+    # Use FAISS retrieval. If disabled, use brute-force metric search.
+    use_faiss_retrieval: bool = False
 
     # -------------------------------------------------------------------
     # Diffusion head
