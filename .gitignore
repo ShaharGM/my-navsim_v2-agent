@@ -35,6 +35,7 @@ personal_notebooks/
 
 # Checkpoints / large outputs
 weights/
+*_perc_traj_pairs.pt
 
 # SLURM logs & error files
 logs_history/
