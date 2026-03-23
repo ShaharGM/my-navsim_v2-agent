@@ -8,7 +8,9 @@ when using the VoV backbone) typically need to be overridden from the
 Hydra YAML.
 """
 from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 
+from nuplan.common.maps.abstract_map import SemanticMapLayer
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 
@@ -111,6 +113,34 @@ class ActionDiffusionConfig:
     nn_trajectory_dim: int = 3
     # Use FAISS retrieval. If disabled, use brute-force metric search.
     use_faiss_retrieval: bool = False
+
+    # -------------------------------------------------------------------
+    # Optional BEV map-line targets (for auxiliary supervision)
+    # -------------------------------------------------------------------
+    # When enabled, ActionDiffusionTargetBuilder returns an additional
+    # vectorized target in ego-local coordinates (meters), where each
+    # individual map line is preserved as a polyline instance.
+    # Output tensors:
+    #   bev_lines_points:      (C, L, P, 2)
+    #   bev_lines_point_mask:  (C, L, P)
+    #   bev_lines_instance_mask:(C, L)
+    # C = number of configured classes, L = max line instances per class,
+    # P = max sampled points per line.
+    use_bev_line_targets: bool = False
+    # Channel configuration: {channel_idx: (entity_type, layers)}
+    # Supported entity_type values:
+    #   - "linestring": draws map_object.baseline_path.linestring
+    #   - "polygon_edge": draws polygon boundary polylines
+    bev_line_classes: Dict[int, Tuple[str, List[SemanticMapLayer]]] = field(
+        default_factory=lambda: {
+            0: ("linestring", [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]),
+            1: ("polygon_edge", [SemanticMapLayer.LANE, SemanticMapLayer.INTERSECTION]),
+        }
+    )
+    bev_line_max_instances: int = 128
+    bev_line_max_points: int = 64
+    bev_line_sample_spacing: float = 1.0
+    bev_radius: float = 64.0
 
     # -------------------------------------------------------------------
     # Diffusion head

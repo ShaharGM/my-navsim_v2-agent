@@ -173,7 +173,7 @@ class _PerceptionTrajectoryMemory:
         )
 
     @torch.no_grad()
-    def query(self, perception_query: torch.Tensor) -> torch.Tensor:
+    def query(self, perception_query: torch.Tensor, k: int = 1) -> torch.Tensor:
         query = perception_query.detach().float().cpu()
         if query.ndim != 2:
             raise ValueError(
@@ -191,19 +191,19 @@ class _PerceptionTrajectoryMemory:
                 query_for_search = F.normalize(query, dim=-1).numpy()
             else:
                 query_for_search = query.numpy()
-            _, nn_idx = self._faiss_index.search(query_for_search, k=1)
-            nn_idx = nn_idx.flatten()
+            _, nn_idx = self._faiss_index.search(query_for_search, k=k)
         else:
             # Brute-force search
             if self._metric == "cosine":
                 query_norm = F.normalize(query, dim=-1)
-                nn_idx = (query_norm @ self._perception_norm.t()).argmax(dim=-1)
+                similarities = query_norm @ self._perception_norm.t()  # (B, M)
+                _, nn_idx = similarities.topk(k, dim=-1)
             else:
                 q_sq = (query ** 2).sum(dim=-1, keepdim=True)
                 dist = q_sq + self._perception_sq.unsqueeze(0) - 2.0 * (query @ self._perception.t())
-                nn_idx = dist.argmin(dim=-1)
+                _, nn_idx = dist.topk(k, dim=-1, largest=False)
 
-        return self._trajectories[nn_idx]
+        return self._trajectories[nn_idx]  # (B, k, T, 3)
 
 
 class ActionDiffusionModel(nn.Module):
@@ -320,10 +320,11 @@ class ActionDiffusionModel(nn.Module):
         if self._use_nn_trajectory_context:
             assert self._nn_memory is not None
             perception_vec = backbone_tokens.mean(dim=1)                  # (B, C)
-            nn_traj = self._nn_memory.query(perception_vec).to(
+            nn_traj_topk = self._nn_memory.query(perception_vec).to(
                 device=tokens.device,
                 dtype=tokens.dtype,
-            )                                                             # (B, S, 3)
+            )                                                             # (B, k, S, 3)
+            nn_traj = nn_traj_topk[:, 0]                                  # (B, S, 3)
             nn_tok = self.nn_traj_encoder(nn_traj.flatten(start_dim=1)).unsqueeze(1)
             context_tokens.append(nn_tok)                                 # (B, 1, D)
 
